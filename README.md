@@ -10,13 +10,21 @@
 
 ## 安装
 
+最简单的方式：把下面这句话直接发给 Claude Code，让它替你完成安装：
+
+```text
+安装 skill https://github.com/zuchengchen/goal-workflow-claude.git
+```
+
+Claude 会 clone 本仓库并执行 `scripts/install-local.sh`，把 canonical skill 复制到 `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/goal-workflow`（安装物只有 `skills/goal-workflow/`，不是仓库根）；完成后新开一个会话即可使用 `/goal-workflow`。预期执行步骤见 [INSTALL.md](INSTALL.md) 的「方法零」。
+
 canonical moving-source 地址（分支随 `master` 更新）：
 
 ```text
 https://github.com/zuchengchen/goal-workflow-claude/tree/master/skills/goal-workflow
 ```
 
-最简单的方式是把 canonical skill 复制到用户级 skills 目录：
+已有本仓库 checkout 时，也可以直接运行安装脚本：
 
 ```bash
 scripts/install-local.sh

@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- README 与 INSTALL 新增「方法零：在 Claude Code 中一句话安装」——把 `安装 skill https://github.com/zuchengchen/goal-workflow-claude.git` 发给 Claude Code，由它按 INSTALL.md 声明的步骤 clone 并执行 `scripts/install-local.sh` 完成安装。
+
 ## [0.5.0]
 
 ### Added

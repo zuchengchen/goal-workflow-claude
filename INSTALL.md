@@ -42,6 +42,25 @@ Claude Code 会在启动时从下列位置发现 skill：
 
 安装后启动新的 Claude Code 会话；已打开的会话可能仍保留旧的 skill 上下文。
 
+## 方法零：在 Claude Code 中一句话安装
+
+在任意 Claude Code 会话中输入：
+
+```text
+安装 skill https://github.com/zuchengchen/goal-workflow-claude.git
+```
+
+这句话的预期语义、也是执行安装的 Claude 应当采用的步骤：
+
+```bash
+tmp_dir="$(mktemp -d)"
+git clone --depth 1 https://github.com/zuchengchen/goal-workflow-claude.git "$tmp_dir"
+"$tmp_dir/scripts/install-local.sh"
+rm -rf -- "$tmp_dir"
+```
+
+安装脚本会先校验 skill 结构，目标已存在时停止且不覆盖；更新已有安装改用 `"$tmp_dir/scripts/install-local.sh" --replace`（保留备份，见「更新」）。需要固定版本时，把 clone 命令改为 `git clone --branch v0.5.0 --depth 1 …` 再执行安装脚本。安装完成后启动新的 Claude Code 会话，确认 `/goal-workflow` 出现。
+
 ## 方法一：从本地仓库直接复制
 
 如果当前工作目录就是本仓库根，可安装到用户目录：
