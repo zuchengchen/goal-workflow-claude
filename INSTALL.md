@@ -16,10 +16,10 @@
 
 canonical URL 同时编码了精确 ref 和 path。canonical 安装路径不是仓库根，而是 `skills/goal-workflow`；本仓库的 moving ref 是 `master`。
 
-为保证可复现，正式环境和团队配置应优先把 URL 中的 `master` 替换为已发布 tag（当前 source 版本 `0.4.0` 发布后对应 `v0.4.0`）或完整 commit SHA：
+为保证可复现，正式环境和团队配置应优先把 URL 中的 `master` 替换为已发布 tag（当前 source 版本 `0.5.0` 发布后对应 `v0.5.0`）或完整 commit SHA：
 
 ```text
-https://github.com/zuchengchen/goal-workflow-claude/tree/v0.4.0/skills/goal-workflow
+https://github.com/zuchengchen/goal-workflow-claude/tree/v0.5.0/skills/goal-workflow
 https://github.com/zuchengchen/goal-workflow-claude/tree/<full-commit-sha>/skills/goal-workflow
 ```
 
@@ -65,7 +65,7 @@ scripts/install-local.sh --dest "/path/to/target-project/.claude/skills/goal-wor
 ```bash
 install_root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
 dest="$install_root/goal-workflow"
-ref="v0.4.0"
+ref="v0.5.0"
 tmp_dir="$(mktemp -d)"
 source_dir="$tmp_dir/goal-workflow"
 
@@ -99,7 +99,7 @@ ref="0123456789abcdef0123456789abcdef01234567"
 
 ```bash
 git clone https://github.com/zuchengchen/goal-workflow-claude.git /path/to/goal-workflow-source
-git -C /path/to/goal-workflow-source checkout --detach v0.4.0
+git -C /path/to/goal-workflow-source checkout --detach v0.5.0
 ```
 
 然后用仓库自带的安全安装脚本把 canonical skill 复制到目标项目：
@@ -181,7 +181,7 @@ dest="/path/to/target-project/.claude/skills/goal-workflow"
 
 ```bash
 git -C /path/to/goal-workflow-source fetch --tags origin
-git -C /path/to/goal-workflow-source checkout --detach v0.4.0
+git -C /path/to/goal-workflow-source checkout --detach v0.5.0
 ```
 
 然后按复制步骤更新安装目录。跟随 moving ref 时可以改为：
@@ -244,6 +244,16 @@ rm -rf -- "$dest"
 ### 更新后仍看到旧行为
 
 检查是否同时存在用户级 `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/goal-workflow` 和项目级 `.claude/skills/goal-workflow`。移除或备份重复来源，并启动新会话。
+
+`SKILL.md` frontmatter 中的 `version` 字段标识安装副本对应的发布版本（0.5.0 之前的安装没有该字段）：
+
+```bash
+grep '^version:' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/goal-workflow/SKILL.md"
+```
+
+### 保存 goal 文件时出现权限提示
+
+goal 文件写入目标项目的 `.claude/goals/`。在默认权限模式下，Claude Code 对 `.claude/` 内文件的写入不会自动放行（本仓库的 eval harness 因此以 `--permission-mode bypassPermissions` 在一次性临时目录中运行，见 tests/README.md）。因此第一道审批通过、skill 实际写盘时，会再出现一次工具权限确认——这是 Claude Code 的防护行为，不是 skill 故障，放行即可。若希望在某个项目中长期免提示，可在该项目 `.claude/settings.json` 的 `permissions.allow` 中加入形如 `Write(.claude/goals/**)` 的规则，具体语法以所用 Claude Code 版本的权限文档为准。无头或自动化环境需要显式选择合适的权限模式。
 
 ### 是否需要安装其他 skill
 

@@ -1,6 +1,6 @@
 {
-  "schema_version": 2,
-  "description": "Declarative behavioral scenarios for goal-workflow gates, fallbacks, language handling, verification integrity, and tool ordering. Checkpoint replies list decisive turns only; a harness must answer routine discovery turns from setup without inventing approvals. Executed by scripts/run-evals.sh.",
+  "schema_version": 3,
+  "description": "Declarative behavioral scenarios for goal-workflow gates, fallbacks, language handling, verification integrity, and tool ordering. Checkpoint replies list decisive turns only; a harness must answer routine discovery turns from setup without inventing approvals. Replies at save_approval and start_approval are restricted to y/yes/n/no because the deterministic gate checks parse them. Executed by scripts/run-evals.sh.",
   "actions": [
     "inspect_context",
     "check_active_goal",
@@ -20,6 +20,7 @@
     "begin_execution",
     "begin_execution_with_budget",
     "handoff_to_new_session",
+    "present_matching_goal_choices",
     "present_goal_conflict_choices",
     "invoke_external_skill",
     "abandon_active_goal",
@@ -44,11 +45,12 @@
   ],
   "checkpoints": {
     "direction_approval": "The assistant has presented two or three candidate approaches with tradeoffs and asks the user to approve one direction. Approving a direction is not approval to save or to start.",
+    "collision_decision": "The assistant has reported that the explicitly requested goal filename already exists and asks, as its own dedicated question, whether to use a collision-free name or explicitly overwrite the existing file. Reached before any draft is shown.",
     "coverage_summary": "The assistant has shown the coverage summary grouped by status, mapped every remaining Unresolved area to a treatment, and asks whether to investigate further or to draft with those mappings.",
     "first_coverage_summary": "The first of two coverage summaries in an exhaustive interview, where the user asks for further investigation before drafting.",
     "second_coverage_summary": "The coverage summary shown after the additional investigation requested at first_coverage_summary.",
     "save_approval": "The first approval gate. The assistant has displayed the complete proposed goal and its absolute save path and asks whether to write that exact content to that exact path. No file has been written yet.",
-    "start_approval": "The second approval gate. The goal file has been written and read back identically, and the assistant asks whether to begin executing it."
+    "start_approval": "The second approval gate. The goal file has been written and read back identically, and the assistant asks a single binary question: whether to begin executing it, or - when the user already chose a handoff - whether to prepare the handoff now."
   },
   "cases": [
     {
@@ -60,7 +62,7 @@
       "checkpoint_replies": [
         {
           "at": "coverage_summary",
-          "content": "n"
+          "content": "No further investigation - draft with those mappings."
         },
         {
           "at": "save_approval",
@@ -116,7 +118,7 @@
           {
             "before": "recheck_path",
             "after": "write_goal_file",
-            "reason": "The atomic write follows the final collision check."
+            "reason": "The final collision recheck precedes publishing the destination file; staging a temporary file earlier in the same turn is not the write."
           },
           {
             "before": "approve_start",
@@ -132,15 +134,15 @@
       "title": "An ambiguous task compares approaches and obtains direction approval",
       "category": "ambiguous",
       "user_language": "zh-CN",
-      "prompt": "/goal-workflow 改进这个项目的目标工作流，让它更好用",
+      "prompt": "/goal-workflow 改进这个项目的鉴权模块，让它更安全",
       "checkpoint_replies": [
         {
           "at": "direction_approval",
-          "content": "y"
+          "content": "用你推荐的方案。"
         },
         {
           "at": "coverage_summary",
-          "content": "n"
+          "content": "不用再调查了，按这些映射起草吧。"
         },
         {
           "at": "save_approval",
@@ -201,7 +203,7 @@
           {
             "before": "recheck_path",
             "after": "write_goal_file",
-            "reason": "The destination is rechecked immediately before writing."
+            "reason": "The destination is rechecked immediately before it is published; staging a temporary file earlier in the same turn is not the write."
           }
         ],
         "terminal_state": "saved_not_started"
@@ -216,15 +218,15 @@
       "checkpoint_replies": [
         {
           "at": "direction_approval",
-          "content": "y"
+          "content": "Go with the approach you recommend."
         },
         {
           "at": "first_coverage_summary",
-          "content": "y"
+          "content": "Yes - investigate the highest-impact unresolved areas further before drafting."
         },
         {
           "at": "second_coverage_summary",
-          "content": "n"
+          "content": "No further investigation; draft with the mappings as shown."
         },
         {
           "at": "save_approval",
@@ -245,7 +247,7 @@
       "expected": {
         "mode": "exhaustive",
         "required_behaviors": [
-          "Ask exactly one focused discovery question per turn.",
+          "Ask one focused discovery question at a time, bundling two details in one turn only when a single decision answers both.",
           "Treat Unresolved as temporary and continue after the first coverage review.",
           "Draft only after the user explicitly elects to stop exploring."
         ],
@@ -295,7 +297,7 @@
       "checkpoint_replies": [
         {
           "at": "coverage_summary",
-          "content": "n"
+          "content": "No more investigation; draft it with those mappings."
         },
         {
           "at": "save_approval",
@@ -351,7 +353,7 @@
       "checkpoint_replies": [
         {
           "at": "coverage_summary",
-          "content": "n"
+          "content": "No more investigation; draft it with those mappings."
         },
         {
           "at": "save_approval",
@@ -400,7 +402,7 @@
           {
             "before": "recheck_path",
             "after": "write_goal_file",
-            "reason": "The atomic write follows the final collision check."
+            "reason": "The final collision recheck precedes publishing the destination file; staging a temporary file earlier in the same turn is not the write."
           },
           {
             "before": "write_goal_file",
@@ -454,6 +456,50 @@
       }
     },
     {
+      "id": "matching-active-goal",
+      "title": "A matching active goal offers continue, revise, or cancel instead of a duplicate",
+      "category": "matching_goal",
+      "user_language": "en-US",
+      "prompt": "/goal-workflow replace the storage layer with a SQLite backend",
+      "checkpoint_replies": [],
+      "setup": {
+        "requested_depth": "auto",
+        "start_mode": "in_session",
+        "active_goal": "matching",
+        "goal_file": "absent",
+        "explicit_token_budget": null
+      },
+      "expected": {
+        "mode": "standard",
+        "required_behaviors": [
+          "Read the saved active goal and recognize it covers the same work as the new request.",
+          "Present numbered choices to continue the existing goal, prepare a revised successor, or cancel this workflow, then wait.",
+          "Do not create a duplicate goal file and do not claim the new-goal states or approvals were traversed."
+        ],
+        "forbidden_actions": [
+          "invoke_external_skill",
+          "abandon_active_goal",
+          "pause_active_goal",
+          "complete_active_goal",
+          "write_goal_file",
+          "begin_execution"
+        ],
+        "tool_order": [
+          {
+            "before": "check_active_goal",
+            "after": "present_matching_goal_choices",
+            "reason": "The match is established from the conversation and the goal file before choices are offered."
+          },
+          {
+            "before": "present_matching_goal_choices",
+            "after": "choose_depth",
+            "reason": "A new interview may begin only if the user asks for a revised successor."
+          }
+        ],
+        "terminal_state": "waiting_on_existing_goal"
+      }
+    },
+    {
       "id": "handoff-to-new-session",
       "title": "A later-session preference produces an exact new-session handoff",
       "category": "handoff",
@@ -462,7 +508,7 @@
       "checkpoint_replies": [
         {
           "at": "coverage_summary",
-          "content": "n"
+          "content": "No more investigation; draft it with those mappings."
         },
         {
           "at": "save_approval",
@@ -500,7 +546,7 @@
           {
             "before": "recheck_path",
             "after": "write_goal_file",
-            "reason": "The final collision check precedes the atomic write."
+            "reason": "The final collision recheck precedes publishing the destination file; staging a temporary file earlier in the same turn is not the write."
           },
           {
             "before": "write_goal_file",
@@ -524,8 +570,12 @@
       "prompt": "/goal-workflow plan the API cleanup and save it as 2026-07-10-api-cleanup.md",
       "checkpoint_replies": [
         {
+          "at": "collision_decision",
+          "content": "Use a collision-free name; do not overwrite."
+        },
+        {
           "at": "coverage_summary",
-          "content": "n"
+          "content": "No more investigation; draft it with those mappings."
         }
       ],
       "setup": {
@@ -538,30 +588,34 @@
       "expected": {
         "mode": "standard",
         "required_behaviors": [
-          "Detect the collision while resolving the path before showing the draft.",
-          "Recheck the selected path immediately before any later atomic write.",
-          "Offer a new path or an explicit overwrite decision one question at a time."
+          "Detect that the explicitly requested filename already exists before proposing any save path.",
+          "Ask a dedicated collision question offering a collision-free name or an explicit overwrite, and proceed only on the user's answer.",
+          "After the user chooses a collision-free name, resolve the new absolute path and show the draft with that exact path."
         ],
         "forbidden_actions": [
           "invoke_external_skill",
           "overwrite_goal_file",
           "write_goal_file",
-          "show_draft",
           "begin_execution"
         ],
         "tool_order": [
           {
-            "before": "show_coverage",
-            "after": "reserve_path",
-            "reason": "Initial path resolution follows discovery and precedes the draft."
-          },
-          {
             "before": "reserve_path",
             "after": "prompt_path_collision",
-            "reason": "The collision is reported before any write is attempted."
+            "reason": "The collision is discovered by checking the explicitly requested path before the dedicated question is asked."
+          },
+          {
+            "before": "prompt_path_collision",
+            "after": "show_coverage",
+            "reason": "The collision decision is resolved as soon as the collision is known, not after the coverage review."
+          },
+          {
+            "before": "show_coverage",
+            "after": "show_draft",
+            "reason": "The coverage summary precedes the complete draft."
           }
         ],
-        "terminal_state": "path_collision_prompt"
+        "terminal_state": "awaiting_save_approval"
       }
     },
     {
@@ -581,8 +635,8 @@
       "expected": {
         "mode": "standard",
         "required_behaviors": [
-          "Restate the intent and ask the first question in Japanese.",
-          "Localize approval prompts instead of emitting fixed Chinese templates."
+          "Restate the intent in Japanese and ask the workflow's first question - a discovery question or a direction approval - in Japanese.",
+          "Ask a single focused question in the first turn and stop to wait for the answer."
         ],
         "forbidden_actions": [
           "invoke_external_skill",
@@ -614,7 +668,7 @@
       "checkpoint_replies": [
         {
           "at": "coverage_summary",
-          "content": "n"
+          "content": "No more investigation; draft it with those mappings."
         },
         {
           "at": "save_approval",
@@ -636,7 +690,7 @@
         "mode": "standard",
         "required_behaviors": [
           "Preserve the explicit 24000 token budget in the saved Execution Options section.",
-          "Apply token_budget 24000 when execution begins after both approvals."
+          "State, when execution begins after both approvals, that it proceeds under the saved 24000-token budget from Execution Options."
         ],
         "forbidden_actions": [
           "invoke_external_skill",
@@ -653,7 +707,7 @@
           {
             "before": "recheck_path",
             "after": "write_goal_file",
-            "reason": "The atomic write follows the final collision check."
+            "reason": "The final collision recheck precedes publishing the destination file; staging a temporary file earlier in the same turn is not the write."
           },
           {
             "before": "write_goal_file",
@@ -678,7 +732,7 @@
       "checkpoint_replies": [
         {
           "at": "coverage_summary",
-          "content": "n"
+          "content": "No more investigation; draft it with those mappings."
         },
         {
           "at": "save_approval",
@@ -741,7 +795,7 @@
           {
             "before": "recheck_path",
             "after": "write_goal_file",
-            "reason": "The approved file is written only after the collision recheck."
+            "reason": "The approved destination is published only after the collision recheck; staging a temporary file earlier in the same turn is not the write."
           },
           {
             "before": "write_goal_file",

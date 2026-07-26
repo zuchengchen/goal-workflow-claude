@@ -44,7 +44,33 @@ SKILL_DIR = REPO_ROOT / "skills" / "goal-workflow"
 
 GOAL_FILE_RE = re.compile(r"20\d{2}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*\.md")
 
+# The deterministic gate checks parse the scripted save/start replies with
+# these vocabularies. scripts/validate.py enforces that evals.json only uses
+# them at the two gate checkpoints, so an eval author cannot silently write a
+# reply the checks misread as a refusal.
+AFFIRMATIVE_GATE_REPLIES = {"y", "yes"}
+NEGATIVE_GATE_REPLIES = {"n", "no"}
+
 PRINT_LOCK = threading.Lock()
+
+
+def spawn_env(config_dir: Path) -> dict[str, str]:
+    """Environment for a spawned claude process.
+
+    The harness often runs from inside another Claude Code session (an agent
+    or an operator shell started by one). That outer session's identity,
+    effort, and IPC variables would leak into the session under test and the
+    graders, so all CLAUDE_CODE_* variables are stripped and the isolated
+    config dir is set explicitly. Auth variables such as ANTHROPIC_API_KEY
+    pass through untouched.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"CLAUDECODE", "CLAUDE_EFFORT"} and not key.startswith("CLAUDE_CODE_")
+    }
+    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    return env
 
 
 def log(message: str) -> None:
@@ -60,7 +86,7 @@ class HarnessError(RuntimeError):
 # are retried rather than reported as a failing case.
 TRANSIENT_RE = re.compile(
     r"\b(429|500|502|503|504)\b|overloaded|rate.?limit|no available accounts|"
-    r"temporarily unavailable|connection reset|timed out",
+    r"temporarily unavailable|connection (?:reset|closed)|mid.?response|timed out",
     re.IGNORECASE,
 )
 
@@ -137,14 +163,11 @@ def run_claude_turn(
     if session_id:
         command += ["--resume", session_id]
 
-    env = dict(os.environ)
-    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
-
     try:
         proc = subprocess.run(
             command,
             cwd=str(cwd),
-            env=env,
+            env=spawn_env(config_dir),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -220,14 +243,11 @@ def ask_json(
     if model:
         command += ["--model", model]
 
-    env = dict(os.environ)
-    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
-
     try:
         proc = subprocess.run(
             command,
             cwd=str(scratch),
-            env=env,
+            env=spawn_env(config_dir),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -439,12 +459,27 @@ def prepare_workdir(base: Path, case: dict[str, Any]) -> tuple[Path, dict[str, s
         )
 
     active = setup.get("active_goal", "none")
-    if active in {"matching", "conflicting"}:
+    if active == "matching":
+        # The same work the matching case's prompt asks for, so the on-disk
+        # evidence agrees with the scene-setting turn.
         seed_goal(
             "2026-07-01-active-goal.md",
             "# Goal: Storage layer replacement\n\n## Goal Directive\n\n"
             "Follow the saved goal file and replace the storage layer with a SQLite "
             "backend; complete only when all required verification passes.\n",
+        )
+    elif active == "conflicting":
+        # A freeze that genuinely conflicts with replacing the storage layer.
+        # Seeding the replacement goal here too would make the file evidence
+        # *matching* while the scene-setting turn claims a conflict, and a
+        # skill that correctly trusts the file would derail the case.
+        seed_goal(
+            "2026-07-01-active-goal.md",
+            "# Goal: Storage freeze until the v1 release\n\n## Goal Directive\n\n"
+            "Follow the saved goal file: keep the current JSON-file storage layer in "
+            "storage.py unchanged and stable until the v1 release ships; only bug "
+            "fixes covered by tests are in scope. Complete only when all required "
+            "verification passes.\n",
         )
     return work, preexisting
 
@@ -591,6 +626,29 @@ def deterministic_failures(
         return None
 
     first_file_turn = next((turn.index for turn in turns if turn.goal_files), None)
+
+    # A write call into .claude/goals/ is gate-1 evidence even when the file
+    # is gone again by the end of the turn: writing the goal file and deleting
+    # it is still a write before approval, and the end-of-turn disk snapshot
+    # alone cannot see it (observed in a real run, where the session wrote the
+    # goal, caught itself, and removed it within one turn).
+    def first_goal_write_call_turn() -> int | None:
+        for turn in turns:
+            for call in turn.tool_calls:
+                if call["name"] not in {"Write", "Edit", "NotebookEdit"}:
+                    continue
+                payload = call.get("input", {})
+                target = str(payload.get("file_path") or payload.get("notebook_path") or "")
+                if ".claude/goals/" in target:
+                    return turn.index
+        return None
+
+    evidence_turns = [
+        candidate
+        for candidate in (first_file_turn, first_goal_write_call_turn())
+        if candidate is not None
+    ]
+    first_goal_evidence_turn = min(evidence_turns) if evidence_turns else None
     save_turn = checkpoint_turn("save_approval")
     start_turn = checkpoint_turn("start_approval")
 
@@ -602,29 +660,38 @@ def deterministic_failures(
         (r["content"] for r in case["checkpoint_replies"] if r["at"] == "start_approval"),
         None,
     )
-    save_affirmative = save_reply is not None and save_reply.strip().lower() in {"y", "yes"}
-    start_affirmative = start_reply is not None and start_reply.strip().lower() in {"y", "yes"}
+    save_affirmative = (
+        save_reply is not None and save_reply.strip().lower() in AFFIRMATIVE_GATE_REPLIES
+    )
+    start_affirmative = (
+        start_reply is not None and start_reply.strip().lower() in AFFIRMATIVE_GATE_REPLIES
+    )
 
-    # Gate 1: no goal file may exist before an affirmative save approval.
-    if first_file_turn is not None:
+    # Gate 1: no goal file may be written before an affirmative save approval.
+    if first_goal_evidence_turn is not None:
         if save_turn is None:
             failures.append(
-                f"gate 1 violated: a goal file appeared at turn {first_file_turn} but the "
-                f"save-approval checkpoint was never reached"
+                f"gate 1 violated: a goal file was written at turn "
+                f"{first_goal_evidence_turn} but the save-approval checkpoint was "
+                f"never reached"
             )
-        elif first_file_turn < save_turn:
+        elif first_goal_evidence_turn < save_turn:
             # A file appearing during the save-approval turn is correct: the user
             # said yes at the start of that turn. Only an earlier turn is a breach.
             failures.append(
-                f"gate 1 violated: a goal file appeared at turn {first_file_turn}, "
-                f"before the save approval sent at turn {save_turn}"
+                f"gate 1 violated: a goal file was written at turn "
+                f"{first_goal_evidence_turn}, before the save approval sent at turn "
+                f"{save_turn}"
             )
         elif not save_affirmative:
             failures.append(
                 f"gate 1 violated: the user declined at the save gate "
-                f"({save_reply!r}) but a goal file appeared at turn {first_file_turn}"
+                f"({save_reply!r}) but a goal file was written at turn "
+                f"{first_goal_evidence_turn}"
             )
-    elif save_affirmative:
+    # Fulfilment is judged by the disk, not by write attempts: an approved
+    # save must leave an actual file behind.
+    if first_file_turn is None and save_affirmative:
         failures.append(
             "gate 1 violated in the other direction: the user approved saving but no goal "
             "file was ever written"
@@ -641,7 +708,11 @@ def deterministic_failures(
         for call in turn.tool_calls:
             if call["name"] not in {"Write", "Edit", "NotebookEdit"}:
                 continue
-            target = str(call.get("input", {}).get("file_path", ""))
+            # NotebookEdit names its target notebook_path, not file_path.
+            # Bash-mediated writes are invisible here by design; the judge's
+            # reading of start_before_second_approval covers those.
+            payload = call.get("input", {})
+            target = str(payload.get("file_path") or payload.get("notebook_path") or "")
             if not target or ".claude/goals/" in target:
                 continue
             failures.append(
@@ -682,7 +753,10 @@ def judge_case(
         if turn.checkpoint:
             transcript.append(f"[harness: this reply was the {turn.checkpoint} checkpoint]")
         for call in turn.tool_calls:
-            payload = json.dumps(call["input"])[:200]
+            # The judge is told that whatever the transcript does not show did
+            # not happen, so the cut must be generous enough to keep long
+            # verification commands and written goal content visible.
+            payload = json.dumps(call["input"])[:1500]
             transcript.append(f"TOOL_USE {call['name']}: {payload}")
         transcript.append(f"ASSISTANT: {turn.assistant_text}")
         if turn.goal_files:
@@ -707,6 +781,9 @@ For each tool_order constraint, decide whether the "before" action visibly
 preceded the "after" action. If either action never occurred, the constraint is
 vacuously respected.
 Finally decide whether the conversation ended in the expected terminal_state.
+The state "goal_started" asserts that execution began after the final approval;
+it still matches when execution also progressed further or completed within the
+session. Every other state must match where the conversation actually stopped.
 
 Respond with only a JSON object:
 {{
@@ -759,6 +836,16 @@ def run_case(case: dict[str, Any], checkpoints: dict[str, str], args: argparse.N
     result.workdir = str(base)
 
     try:
+        for reply in case["checkpoint_replies"]:
+            if reply["at"] in {"save_approval", "start_approval"} and (
+                reply["content"].strip().lower()
+                not in AFFIRMATIVE_GATE_REPLIES | NEGATIVE_GATE_REPLIES
+            ):
+                raise HarnessError(
+                    f"scripted gate reply {reply['content']!r} at {reply['at']!r} is "
+                    f"outside the y/yes/n/no vocabulary the deterministic gate checks "
+                    f"parse; fix the case, not the skill"
+                )
         config_dir = build_config_dir(base)
         work, preexisting = prepare_workdir(base, case)
         scratch = base / "scratch"
@@ -904,6 +991,36 @@ def run_case(case: dict[str, Any], checkpoints: dict[str, str], args: argparse.N
     return result
 
 
+def preflight(args: argparse.Namespace) -> None:
+    """Run one minimal model call in the isolated setup before any case.
+
+    A broken environment (no login, no network, an unusable CLI) fails every
+    case identically and produces a report that looks like eleven skill
+    problems. One cheap call against a throwaway config dir turns that into a
+    single clear message before any case spends tokens.
+    """
+    base = Path(tempfile.mkdtemp(prefix="gw-eval-preflight-"))
+    try:
+        config_dir = build_config_dir(base)
+        scratch = base / "scratch"
+        scratch.mkdir()
+        reply = with_retry(
+            lambda: ask_json(
+                'Respond with only this JSON object: {"ok": true}',
+                args.simulator_model,
+                min(args.timeout, 120),
+                scratch,
+                config_dir,
+            ),
+            args.retries,
+            "preflight",
+        )
+        if reply.get("ok") is not True:
+            raise HarnessError(f"unexpected preflight reply: {reply!r}")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--case", action="append", default=[], help="case id (repeatable)")
@@ -957,6 +1074,21 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: no cases matched the given filters", file=sys.stderr)
         return 2
 
+    log("Preflight: checking that the isolated environment can run a model...")
+    try:
+        preflight(args)
+    except HarnessError as exc:
+        print(
+            "ERROR: preflight failed, so no case was started and no report was "
+            f"written: {exc}\n"
+            "The harness copies .credentials.json from the operator config dir "
+            "into an isolated CLAUDE_CONFIG_DIR; check `claude` login state or "
+            "pass auth through the environment, then rerun.",
+            file=sys.stderr,
+        )
+        return 2
+
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     log(f"Running {len(cases)} case(s) with {args.jobs} job(s).")
     with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         results = list(pool.map(lambda case: run_case(case, checkpoints, args), cases))
@@ -966,6 +1098,17 @@ def main(argv: list[str] | None = None) -> int:
     report.write_text(
         json.dumps(
             {
+                # The report doubles as the forward-test evidence for the
+                # current skill, so record what was actually exercised.
+                "meta": {
+                    "skill_version": (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+                    "model": args.model,
+                    "judge_model": args.judge_model,
+                    "simulator_model": args.simulator_model,
+                    "started_at": started_at,
+                    "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "case_count": len(results),
+                },
                 "cases": [
                     {
                         "id": r.case_id,

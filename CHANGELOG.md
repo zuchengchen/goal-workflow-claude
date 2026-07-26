@@ -4,6 +4,38 @@
 
 ## [Unreleased]
 
+## [0.5.0]
+
+### Added
+
+- SKILL.md frontmatter 增加 `version` 字段，安装副本可追溯到发布版本。校验器要求 canonical bundle 的该字段与 VERSION 一致；已安装 bundle 中该字段可选，0.5.0 之前的安装仍能通过 `--replace` 与卸载流程的身份校验。
+- 新增 `matching_goal` eval case：已有同内容 active goal 时必须给出 continue / revised successor / cancel 编号选项，不得创建重复 goal，也不得声称新目标的状态或审批已经走过。`setup.active_goal: "matching"` 由无人引用的死词汇变为被覆盖的分支。
+- eval harness 增加 preflight：正式跑 case 之前先在隔离 `CLAUDE_CONFIG_DIR` 里做一次最小模型调用。认证或环境问题现在一次性报清并以退出码 2 结束，不再产出一整份全是相同 harness error 的报告（0.4.0 留下的最后一份报告即因未登录而 11 个 case 全灭）。
+- eval 报告新增 `meta`（skill 版本、被测/模拟/评审模型、起止时间），作为前向测试证据留痕。
+- INSTALL.md 排错新增「保存 goal 文件时出现权限提示」与安装副本版本识别方法。
+
+### Changed
+
+- conflicting 与 matching 场景现在种入内容不同的 active goal：conflicting 种「存储层冻结」目标，与新请求真实冲突。此前两者种同一个「替换存储层」文件，conflicting case 的盘上证据实际是 matching，正确读取文件证据的 skill 反而可能被判偏航。
+- `tests/evals.json` 升级到 schema_version 3：save/start 两道闸门的脚本化回复限定为 y/yes/n/no（大小写不敏感），与 harness 确定性判定共用同一词表，由校验器和 harness 双侧强制；coverage 与 direction checkpoint 的回复由裸 "y"/"n" 改为无歧义的自然语言，避免对「继续调查还是起草」这类二选一问题的误读。
+- japanese case 的 required_behaviors 仅保留单轮对话内可观察的行为；此前的「Localize approval prompts」在零 checkpoint 的对话里无法展示，judge 按「未展示即未发生」会误判。token_budget case 的「Apply」改为可从 transcript 判定的表述；ambiguous case 的 prompt 改为 fixture 中真实存在的鉴权模块，此前指向 fixture 里不存在的「目标工作流」。
+- judge transcript 中 tool 输入截断从 200 字符放宽到 1500，长验证命令与写入的 goal 内容不再因截断而被 judge 当作未发生。
+- harness 生成的 claude 子进程剥离外层会话环境变量（`CLAUDECODE`、`CLAUDE_CODE_*`、`CLAUDE_EFFORT`），嵌套会话身份与 effort 不再泄漏进被测会话与评审模型。
+
+### Changed (评测驱动的收紧)
+
+- 首轮 0.5.0 全量评测（6 过 6 挂，0 harness error）暴露出真实偏航，SKILL.md 相应收紧：两道闸门规则明确「写入后删除仍算写入、草稿只以消息文本展示」；追加调查后必须重新展示覆盖摘要并再次征求同意；用户显式指定的文件名发生碰撞时，改名或覆盖必须作为独立问题先问；第二道闸门在用户已声明交接偏好时改问「是否现在准备交接」，不得把执行/交接当作新选择重新抛出；带 `token_budget` 的 goal 开始执行时必须声明按该预算执行；校准或验证未实际运行前不得表述为已完成。
+- eval 契约随之校准：japanese case 首问允许是 discovery 或 direction 问题（语言才是被测点）；collision case 删去在其终态下无法展示的「写前复查」行为；`recheck_path -> write_goal_file` 的排序理由明确「先暂存临时文件、后复查再发布目标文件」不算违序；`start_approval` checkpoint 描述覆盖交接偏好下的二元问法。
+- 第三轮评测（11 过 1 挂，0 harness error）后的收紧：语言不变量由列举式（问题、选项、摘要、审批、交接）扩为一切用户可见输出，包括工具调用之间的过程叙述与状态说明——此前中文会话中夹带英文过程叙述不在禁止范围内。
+- 次轮评测（9 过 2 挂 1 瞬态网络错误）后的第二次收紧：访谈不变量禁止用 "and" 串联可独立回答的问题；碰撞专问改为「发现碰撞时立即提出」。collision case 重设计——碰撞决策成为脚本化 checkpoint（新增 `collision_decision`，模拟用户不再对该决定自由发挥），对话经覆盖摘要走到 save 闸门收尾，终态由 `path_collision_prompt` 改为 `awaiting_save_approval`。judge 对 `goal_started` 的语义明确为「至少已开始」：执行在会话内继续推进乃至完成仍然匹配，其余终态仍须严格吻合。harness 的瞬态错误识别补充 `connection closed` / `mid-response`。
+
+### Fixed
+
+- gate-1 确定性检查同时审查写入 `.claude/goals/` 的工具调用：轮内「写入后又删除」此前只靠轮末磁盘快照无法察觉（首轮评测实录），现在会被判定为审批前写入。
+- gate-2 确定性检查读取 NotebookEdit 的 `notebook_path`；此前统一取 `file_path`，对 NotebookEdit 恒为空串，start 审批前的笔记本写入永远不会被判定。
+- 文本卫生检查改按原始字节检测回车行尾；此前文本模式读取的换行翻译吞掉 `\r`，CRLF 文件本地放行而 CI 的 `git diff --check` 拒绝，「本地检查是 CI 超集」的注释不成立。
+- 为已发布的 0.4.0 补打 `v0.4.0` tag。此前 INSTALL.md 推荐固定安装的 tag 在远端并不存在，按文档执行的可复现安装直接失败。
+
 ## [0.4.0]
 
 ### Added

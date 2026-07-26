@@ -1,6 +1,7 @@
 ---
 name: goal-workflow
 description: Turn a rough task into an approved, saved, and executable Claude Code goal through adaptive brainstorming and a one-question-at-a-time discovery interview. Use when the user invokes `/goal-workflow`, asks to define or refine a durable goal, or wants explicit scope, verification, risk, file-save approval, and execution approval before work begins.
+version: 0.5.0
 ---
 
 # Goal Workflow
@@ -11,7 +12,8 @@ This workflow exists to enforce exactly two approval gates. Everything below is
 supporting detail; these two rules are the product.
 
 1. **Never write the goal file** until the user explicitly approves that exact
-   content at that exact absolute path.
+   content at that exact absolute path. Writing a file under `.claude/goals/`
+   and deleting it again is still a write; show drafts only as message text.
 2. **Never begin executing** the goal until the file is written, read back
    identical to the approved content, and the user explicitly approves starting.
 
@@ -29,8 +31,8 @@ This is a planning workflow until the goal becomes active. Do not implement the 
 
 ## Invariants
 
-- Use the user's language for every question, option, summary, approval request, and handoff. Do not reuse a fixed-language template.
-- Ask one concise discovery question at a time. Ask two details together only when they cannot be answered independently.
+- Use the user's language for every user-visible message — including brief narration and status remarks between tool calls, not only questions, options, summaries, approval requests, and the handoff. Do not reuse a fixed-language template.
+- Ask one concise discovery question at a time. Ask two details together only when a single decision answers both; never chain independently answerable questions with "and" in one turn.
 - Inspect relevant local context before asking the user for facts that can be discovered safely.
 - Do not silently expand scope or weaken verification.
 - Never copy secret values, credentials, or private tokens into the draft or saved goal file; refer to their names or retrieval mechanism instead.
@@ -133,7 +135,7 @@ Before drafting, show a concise coverage summary grouped by status. Map every re
 - an out-of-scope boundary; or
 - a stop condition that forbids guessing during execution.
 
-Keep its history visible as `Unresolved -> <treatment>`; do not relabel it as answered. Ask whether the user wants to investigate further or draft with those mappings. Do not draft until the user accepts the mapping. If an unresolved item would make execution unsafe or impossible, keep interviewing instead of converting it into an assumption.
+Keep its history visible as `Unresolved -> <treatment>`; do not relabel it as answered. Ask whether the user wants to investigate further or draft with those mappings. Do not draft until the user accepts the mapping. If the user chooses further investigation, show an updated coverage summary afterwards and ask again: drafting always requires acceptance of the latest summary, not an earlier one. If an unresolved item would make execution unsafe or impossible, keep interviewing instead of converting it into an assumption.
 
 ### Verification Integrity
 
@@ -141,7 +143,7 @@ Treat each automated verification item as an oracle that must distinguish three 
 
 1. **Prefer the producing tool's own verdict.** Use its documented exit status and machine-readable or structured report before resorting to text matching.
 2. **Require positive evidence that the work ran.** Absence of a known error string proves nothing. When a runner can succeed with zero applicable work, assert that the expected tests or items were discovered and executed. Pair every negative assertion with positive evidence that the intended build, test, scanner, or code path actually ran.
-3. **Calibrate any text matcher.** If text matching is unavoidable, match the diagnostic record's severity, origin, delimiters, and required multiline context, not a broad prefix or keyword. Distinguish real failures from echoed input, source excerpts, wrapped continuation lines, summaries such as `0 errors`, and allowed warnings. Calibrate every nontrivial custom matcher or parser against at least one representative failure and one benign collision, including multiline, wrapped, escaped, or continuation forms when the format permits them.
+3. **Calibrate any text matcher.** If text matching is unavoidable, match the diagnostic record's severity, origin, delimiters, and required multiline context, not a broad prefix or keyword. Distinguish real failures from echoed input, source excerpts, wrapped continuation lines, summaries such as `0 errors`, and allowed warnings. Calibrate every nontrivial custom matcher or parser against at least one representative failure and one benign collision, including multiline, wrapped, escaped, or continuation forms when the format permits them. Never describe a calibration or verification as performed unless its commands actually ran in the current session; until then present it as pending.
 4. **Let failures reach the exit status.** Setup, the producer, and every assertion must contribute to the final status. Preserve failures through pipelines and wrappers, and avoid early-terminating live search pipelines that can change an upstream status. Distinguish `match`, `no match`, and `search/read/parse error`. Never use a bare negated search such as `! grep` or `! rg` for an absence assertion, and never use `|| true` where it can convert an operational failure into success.
 5. **Use only complete evidence from the current run.** Use a clean or unique output location or remove prior outputs first; capture every relevant stream in stable noninteractive form; then require expected reports, logs, and artifacts to exist, be readable, be nonempty when applicable, and belong to the current target and run. Accept cached evidence only when its key or provenance is demonstrably tied to the current inputs and target.
 6. **Treat indeterminate as failed.** Missing, stale, truncated, unreadable, unparsable, or otherwise indeterminate evidence is inconclusive, never success. If a sound automated oracle cannot be defined, use an explicit manual acceptance criterion or a stop condition instead of an uncalibrated heuristic.
@@ -163,7 +165,7 @@ Resolve the save path before asking for save approval:
 1. Determine the target project root from reliable workspace or repository evidence. Use `<project-root>/.claude/goals/` when the root is known; otherwise use `<cwd>/.claude/goals/`.
 2. Build `<YYYY-MM-DD>-<slug>.md`. Use a lowercase ASCII slug matching `[a-z0-9]+(?:-[a-z0-9]+)*`; transliterate or summarize non-ASCII titles, limit it to 60 characters, and use a deterministic generic slug if needed.
 3. Resolve and display an absolute normalized path. Never present `~`, a relative path, or a path whose base is ambiguous.
-4. Check whether the path already exists before approval. For a collision, recommend a new collision-free name. Overwriting requires a separate, explicit approval tied to the exact absolute path; do not bundle overwrite consent with prompt approval and never overwrite silently.
+4. Check whether the path already exists before approval. For a collision, recommend a new collision-free name. When the colliding path or filename was explicitly requested by the user, do not substitute a different name on your own: ask, as its own dedicated question as soon as the collision is known, whether to use a collision-free name or explicitly overwrite. Overwriting requires a separate, explicit approval tied to the exact absolute path; do not bundle overwrite consent with prompt approval and never overwrite silently.
 
 Draft the complete file in this form:
 
@@ -244,7 +246,7 @@ Report the absolute path and a concise objective summary. Any content or path ch
 
 ### Approve Start
 
-This is the second gate. Only after successful readback, ask in the user's language whether to begin executing the goal from the saved file. Clearly identify this as the second approval gate and name the accepted affirmative and negative replies.
+This is the second gate. Only after successful readback, ask in the user's language whether to begin executing the goal from the saved file. When the user has already chosen to run the goal later or in a separate session, ask instead whether to prepare that handoff now; an affirmative answer opens this gate for the handoff path. Either way ask one binary question — do not reopen execute-now versus hand-off as a fresh choice when the user has already stated the preference. Clearly identify this as the second approval gate and name the accepted affirmative and negative replies.
 
 Enter `start_approved` only after an unambiguous affirmative answer. If the user declines, remain `saved` and provide the absolute file path for later use.
 
@@ -256,7 +258,7 @@ Recheck existing goal state after entering `start_approved`.
 - If a matching goal is already being executed, do not start a duplicate; confirm that it is the execution target.
 - If a conflict remains, use the Existing Goal rules and remain `start_approved` until resolved.
 - If the user prefers to run the goal later or in a separate session, hand off instead of executing now: provide the exact localized message to paste into a new Claude Code session, in the form `Follow the saved goal file at <absolute-path> and complete it only when all required verification passes.` Do not claim execution began until the user confirms running it or observable progress confirms it.
-- Preserve any explicitly requested `token_budget` in the saved `Execution Options` section so resumed or handed-off execution can recover it. Never infer a token budget from interview depth, task size, or available context.
+- Preserve any explicitly requested `token_budget` in the saved `Execution Options` section so resumed or handed-off execution can recover it. When beginning execution of a goal whose `Execution Options` record a `token_budget`, state that execution proceeds under that budget. Never infer a token budget from interview depth, task size, or available context.
 
 Enter `active` only after in-session execution has begun, the matching goal was confirmed as the execution target, or the user confirmed running the handoff.
 

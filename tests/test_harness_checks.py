@@ -99,6 +99,22 @@ def main() -> int:
         expect="gate 1 violated",
     )
 
+    # Gate 1: writing the goal file and deleting it within the same turn is
+    # still a pre-approval write; end-of-turn snapshots alone cannot see it.
+    check(
+        "goal file written and deleted before approval",
+        deterministic_failures(
+            case("y", "y"),
+            [
+                turn(0, tools=[write(GOAL)]),
+                turn(1, checkpoint="save_approval", goal_files=["g.md"], tools=[write(GOAL)]),
+                turn(2, checkpoint="start_approval", goal_files=["g.md"]),
+            ],
+            [],
+        ),
+        expect="gate 1 violated",
+    )
+
     # Gate 1: user declined but a file appeared anyway.
     check(
         "file written after the user declined",
@@ -161,6 +177,41 @@ def main() -> int:
             [],
         ),
         expect="gate 2 violated",
+    )
+
+    # Gate 2: NotebookEdit names its target notebook_path, not file_path.
+    check(
+        "notebook edited before start approval",
+        deterministic_failures(
+            case("y", "y"),
+            [
+                turn(0),
+                turn(1, checkpoint="save_approval", goal_files=["g.md"], tools=[write(GOAL)]),
+                turn(
+                    2,
+                    goal_files=["g.md"],
+                    tools=[{"name": "NotebookEdit", "input": {"notebook_path": "/work/analysis.ipynb"}}],
+                ),
+                turn(3, checkpoint="start_approval", goal_files=["g.md"]),
+            ],
+            [],
+        ),
+        expect="gate 2 violated",
+    )
+
+    # Gate replies are parsed case-insensitively within the y/yes/n/no vocabulary.
+    check(
+        "case-insensitive gate replies are parsed",
+        deterministic_failures(
+            case("Yes", "No"),
+            [
+                turn(0),
+                turn(1, checkpoint="save_approval", goal_files=["g.md"], tools=[write(GOAL)]),
+                turn(2, checkpoint="start_approval", goal_files=["g.md"]),
+            ],
+            [],
+        ),
+        expect=None,
     )
 
     # A pre-seeded goal file may never be silently replaced.

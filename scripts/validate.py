@@ -39,6 +39,7 @@ REQUIRED_EVAL_CATEGORIES = {
     "exhaustive",
     "reject_save",
     "reject_start",
+    "matching_goal",
     "conflicting_goal",
     "handoff",
     "path_collision",
@@ -46,6 +47,13 @@ REQUIRED_EVAL_CATEGORIES = {
     "token_budget",
     "verification_integrity",
 }
+
+# The harness's deterministic gate checks parse the scripted replies at these
+# checkpoints mechanically (see AFFIRMATIVE_GATE_REPLIES in run_evals.py). A
+# reply outside this vocabulary would be misread as a refusal, so the schema
+# forbids it.
+GATE_CHECKPOINTS = {"save_approval", "start_approval"}
+GATE_REPLIES = {"y", "yes", "n", "no"}
 
 SEMVER = (
     r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
@@ -132,12 +140,19 @@ def parse_frontmatter(text: str, path: Path, checks: Checks) -> tuple[dict[str, 
 
 
 def validate_frontmatter(
-    skill_dir: Path, text: str, skill_path: Path, checks: Checks
+    skill_dir: Path,
+    text: str,
+    skill_path: Path,
+    checks: Checks,
+    expected_version: str | None = None,
 ) -> str:
     metadata, body = parse_frontmatter(text, skill_path, checks)
+    # version is optional so that bundles installed before it existed still
+    # pass the identity checks that the replace and uninstall flows run.
     checks.require(
-        set(metadata) == {"name", "description"},
-        f"{skill_path} frontmatter must contain only name and description",
+        {"name", "description"} <= set(metadata) <= {"name", "description", "version"},
+        f"{skill_path} frontmatter must contain name and description, "
+        f"plus at most version",
     )
     checks.require(
         metadata.get("name") == SKILL_NAME,
@@ -156,6 +171,18 @@ def validate_frontmatter(
         "/goal-workflow" in description,
         f"{skill_path} description must include the /goal-workflow trigger",
     )
+    version = metadata.get("version")
+    if version is not None:
+        checks.require(
+            re.fullmatch(SEMVER, version) is not None,
+            f"{skill_path} frontmatter version must be a semantic version; got {version!r}",
+        )
+    if expected_version is not None:
+        checks.require(
+            version == expected_version,
+            f"{skill_path} frontmatter version must equal VERSION "
+            f"{expected_version!r}; got {version!r}",
+        )
     return body
 
 
@@ -194,7 +221,12 @@ def validate_skill_structure(body: str, path: Path, checks: Checks) -> None:
     )
 
 
-def validate_skill_bundle(skill_dir: Path, checks: Checks, identity_only: bool = False) -> None:
+def validate_skill_bundle(
+    skill_dir: Path,
+    checks: Checks,
+    identity_only: bool = False,
+    expected_version: str | None = None,
+) -> None:
     checks.require(skill_dir.name == SKILL_NAME, f"skill directory must be named {SKILL_NAME}")
     checks.require(skill_dir.is_dir(), f"skill directory does not exist: {skill_dir}")
     if not skill_dir.is_dir():
@@ -204,7 +236,9 @@ def validate_skill_bundle(skill_dir: Path, checks: Checks, identity_only: bool =
     text = checks.read_text(skill_path)
     if text is None:
         return
-    body = validate_frontmatter(skill_dir, text, skill_path, checks)
+    body = validate_frontmatter(
+        skill_dir, text, skill_path, checks, expected_version=expected_version
+    )
     if identity_only:
         return
     validate_skill_structure(body, skill_path, checks)
@@ -292,6 +326,13 @@ def validate_eval_case(
                     f"{reply_label}.at is not a declared checkpoint: {at!r}",
                 )
                 used_checkpoints.add(at)
+            content = reply.get("content")
+            if at in GATE_CHECKPOINTS and isinstance(content, str):
+                checks.require(
+                    content.strip().lower() in GATE_REPLIES,
+                    f"{reply_label}.content at {at!r} must be one of y/yes/n/no "
+                    f"(case-insensitive) so the deterministic gate checks can read it",
+                )
 
     setup = case.get("setup")
     setup_keys = {
@@ -379,10 +420,11 @@ def validate_eval_case(
     terminal_states = {
         "awaiting_question",
         "awaiting_revision",
+        "awaiting_save_approval",
         "saved_not_started",
         "goal_started",
+        "waiting_on_existing_goal",
         "waiting_on_conflict",
-        "path_collision_prompt",
         "handoff_prepared",
     }
     checks.require(
@@ -413,7 +455,7 @@ def validate_evals(path: Path, checks: Checks) -> None:
         str(path),
         checks,
     )
-    checks.require(document.get("schema_version") == 2, f"{path} schema_version must be 2")
+    checks.require(document.get("schema_version") == 3, f"{path} schema_version must be 3")
     checks.require(
         isinstance(document.get("description"), str) and bool(document.get("description", "").strip()),
         f"{path} description must be a non-empty string",
@@ -495,13 +537,26 @@ def validate_text_hygiene(root: Path, checks: Checks) -> None:
             continue
         if path.suffix not in text_suffixes and path.name not in text_names:
             continue
-        text = checks.read_text(path)
-        if text is None:
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            checks.errors.append(f"cannot read {path}: {exc}")
             continue
-        # Mirror the three whitespace rules that Git's default core.whitespace
+        # Git's default rules also reject a carriage return at end of line,
+        # but a text-mode read hides CRLF behind newline translation, so the
+        # carriage-return check must look at the raw bytes.
+        if b"\r" in data:
+            line_number = data[: data.index(b"\r")].count(b"\n") + 1
+            checks.errors.append(f"carriage return in {path}:{line_number}")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            checks.errors.append(f"file is not valid UTF-8: {path}: {exc}")
+            continue
+        # Mirror the whitespace rules that Git's default core.whitespace
         # enforces via `git diff --check` in CI, so this local check is a
         # superset and never passes text that CI would reject:
-        # blank-at-eol, space-before-tab, and blank-at-eof.
+        # blank-at-eol, space-before-tab, blank-at-eof, and the CR check above.
         for line_number, line in enumerate(text.splitlines(), start=1):
             # blank-at-eol: no trailing spaces or tabs.
             checks.require(
@@ -575,8 +630,21 @@ def validate_install_urls(root: Path, version: str, checks: Checks) -> None:
 
 
 def validate_repository(root: Path, checks: Checks) -> None:
+    version_path = root / "VERSION"
+    version_text = checks.read_text(version_path)
+    version = version_text.strip() if version_text is not None else ""
+    version_ok = re.fullmatch(SEMVER, version) is not None
+    checks.require(
+        version_ok,
+        f"{version_path} must contain exactly one semantic version",
+    )
+
     canonical = root / "skills" / SKILL_NAME
-    validate_skill_bundle(canonical, checks)
+    # The canonical bundle must carry the release version so an installed
+    # copy can be traced back to it; installed bundles are allowed to omit it.
+    validate_skill_bundle(
+        canonical, checks, expected_version=version if version_ok else None
+    )
     validate_text_hygiene(root, checks)
 
     expected_bundle_files = {"SKILL.md"}
@@ -619,13 +687,6 @@ def validate_repository(root: Path, checks: Checks) -> None:
     validate_evals(root / "tests" / "evals.json", checks)
     checks.require((root / "tests" / "README.md").is_file(), "missing tests/README.md")
 
-    version_path = root / "VERSION"
-    version_text = checks.read_text(version_path)
-    version = version_text.strip() if version_text is not None else ""
-    checks.require(
-        re.fullmatch(SEMVER, version) is not None,
-        f"{version_path} must contain exactly one semantic version",
-    )
     validate_install_urls(root, version, checks)
     changelog_path = root / "CHANGELOG.md"
     changelog = checks.read_text(changelog_path)
