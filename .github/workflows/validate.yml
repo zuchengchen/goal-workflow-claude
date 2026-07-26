@@ -1,0 +1,33 @@
+name: validate
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Detect whitespace errors
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+
+      - name: Validate skill, evals, and repository hygiene
+        run: scripts/validate.sh
+
+      - name: Test the eval harness's deterministic checks
+        run: python3 tests/test_harness_checks.py
+
+      - name: Exercise install, replace, backup, and uninstall flows
+        run: scripts/smoke-install.sh
+
+      # scripts/run-evals.sh is deliberately not run here: it drives a live
+      # model and spends tokens. Run it locally whenever SKILL.md changes.

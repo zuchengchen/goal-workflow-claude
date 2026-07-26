@@ -1,0 +1,16 @@
+# Local goal files created by the goal-workflow skill.
+.claude/goals/
+
+# Session-local Claude Code settings.
+.claude/settings.local.json
+
+# Eval harness output.
+tests/results/
+
+# Python bytecode caches.
+__pycache__/
+*.pyc
+
+# Editor and OS noise.
+*.swp
+.DS_Store

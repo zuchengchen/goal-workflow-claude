@@ -1,0 +1,756 @@
+{
+  "schema_version": 2,
+  "description": "Declarative behavioral scenarios for goal-workflow gates, fallbacks, language handling, verification integrity, and tool ordering. Checkpoint replies list decisive turns only; a harness must answer routine discovery turns from setup without inventing approvals. Executed by scripts/run-evals.sh.",
+  "actions": [
+    "inspect_context",
+    "check_active_goal",
+    "choose_depth",
+    "ask_question",
+    "compare_approaches",
+    "approve_direction",
+    "show_coverage",
+    "approve_draft",
+    "show_draft",
+    "approve_save",
+    "reserve_path",
+    "recheck_path",
+    "prompt_path_collision",
+    "write_goal_file",
+    "approve_start",
+    "begin_execution",
+    "begin_execution_with_budget",
+    "handoff_to_new_session",
+    "present_goal_conflict_choices",
+    "invoke_external_skill",
+    "abandon_active_goal",
+    "pause_active_goal",
+    "complete_active_goal",
+    "overwrite_goal_file",
+    "ask_multiple_questions",
+    "draft_before_direction_approval",
+    "draft_before_coverage_review",
+    "write_before_save_approval",
+    "start_before_second_approval",
+    "change_language",
+    "set_unrequested_token_budget",
+    "drop_explicit_token_budget",
+    "inspect_verification_oracle",
+    "calibrate_verification_oracle",
+    "accept_uncalibrated_text_matcher",
+    "classify_any_bang_prefixed_line_as_tex_error",
+    "ignore_producer_exit_status",
+    "reuse_stale_verification_artifact",
+    "treat_inconclusive_evidence_as_success"
+  ],
+  "checkpoints": {
+    "direction_approval": "The assistant has presented two or three candidate approaches with tradeoffs and asks the user to approve one direction. Approving a direction is not approval to save or to start.",
+    "coverage_summary": "The assistant has shown the coverage summary grouped by status, mapped every remaining Unresolved area to a treatment, and asks whether to investigate further or to draft with those mappings.",
+    "first_coverage_summary": "The first of two coverage summaries in an exhaustive interview, where the user asks for further investigation before drafting.",
+    "second_coverage_summary": "The coverage summary shown after the additional investigation requested at first_coverage_summary.",
+    "save_approval": "The first approval gate. The assistant has displayed the complete proposed goal and its absolute save path and asks whether to write that exact content to that exact path. No file has been written yet.",
+    "start_approval": "The second approval gate. The goal file has been written and read back identically, and the assistant asks whether to begin executing it."
+  },
+  "cases": [
+    {
+      "id": "narrow-fast-path",
+      "title": "A narrow task uses the fast interview without bypassing either gate",
+      "category": "narrow",
+      "user_language": "en-US",
+      "prompt": "/goal-workflow fast: fix the typo in the CLI help and run the existing focused test",
+      "checkpoint_replies": [
+        {
+          "at": "coverage_summary",
+          "content": "n"
+        },
+        {
+          "at": "save_approval",
+          "content": "y"
+        },
+        {
+          "at": "start_approval",
+          "content": "y"
+        }
+      ],
+      "setup": {
+        "requested_depth": "fast",
+        "start_mode": "in_session",
+        "active_goal": "none",
+        "goal_file": "absent",
+        "explicit_token_budget": null
+      },
+      "expected": {
+        "mode": "fast",
+        "required_behaviors": [
+          "State the narrow assumed approach and ask only high-risk missing questions.",
+          "Show the draft and obtain separate save and start approvals.",
+          "Begin executing the goal only after the saved file exists and start approval is affirmative."
+        ],
+        "forbidden_actions": [
+          "invoke_external_skill",
+          "ask_multiple_questions",
+          "write_before_save_approval",
+          "start_before_second_approval",
+          "set_unrequested_token_budget"
+        ],
+        "tool_order": [
+          {
+            "before": "check_active_goal",
+            "after": "choose_depth",
+            "reason": "Existing state is checked before the interview begins."
+          },
+          {
+            "before": "show_coverage",
+            "after": "reserve_path",
+            "reason": "Coverage is reviewed before the path and draft are finalized."
+          },
+          {
+            "before": "reserve_path",
+            "after": "show_draft",
+            "reason": "The approved path is part of the displayed draft."
+          },
+          {
+            "before": "approve_save",
+            "after": "recheck_path",
+            "reason": "The path is checked again only after the first gate opens."
+          },
+          {
+            "before": "recheck_path",
+            "after": "write_goal_file",
+            "reason": "The atomic write follows the final collision check."
+          },
+          {
+            "before": "approve_start",
+            "after": "begin_execution",
+            "reason": "The second gate protects the start of execution."
+          }
+        ],
+        "terminal_state": "goal_started"
+      }
+    },
+    {
+      "id": "ambiguous-design-choice",
+      "title": "An ambiguous task compares approaches and obtains direction approval",
+      "category": "ambiguous",
+      "user_language": "zh-CN",
+      "prompt": "/goal-workflow 改进这个项目的目标工作流，让它更好用",
+      "checkpoint_replies": [
+        {
+          "at": "direction_approval",
+          "content": "y"
+        },
+        {
+          "at": "coverage_summary",
+          "content": "n"
+        },
+        {
+          "at": "save_approval",
+          "content": "y"
+        },
+        {
+          "at": "start_approval",
+          "content": "n"
+        }
+      ],
+      "setup": {
+        "requested_depth": "auto",
+        "start_mode": "in_session",
+        "active_goal": "none",
+        "goal_file": "absent",
+        "explicit_token_budget": null
+      },
+      "expected": {
+        "mode": "standard",
+        "required_behaviors": [
+          "Inspect the repository before recommending a direction.",
+          "Present two or three approaches with trade-offs and recommend one.",
+          "Remain in Chinese and stop after the user rejects goal execution start."
+        ],
+        "forbidden_actions": [
+          "invoke_external_skill",
+          "draft_before_direction_approval",
+          "draft_before_coverage_review",
+          "begin_execution",
+          "change_language"
+        ],
+        "tool_order": [
+          {
+            "before": "inspect_context",
+            "after": "compare_approaches",
+            "reason": "Recommendations must reflect the local project."
+          },
+          {
+            "before": "compare_approaches",
+            "after": "approve_direction",
+            "reason": "The user approves a concrete design direction."
+          },
+          {
+            "before": "approve_direction",
+            "after": "show_coverage",
+            "reason": "Discovery proceeds from the approved direction."
+          },
+          {
+            "before": "reserve_path",
+            "after": "show_draft",
+            "reason": "The exact path is shown as part of the draft."
+          },
+          {
+            "before": "approve_save",
+            "after": "recheck_path",
+            "reason": "Saving remains a separate explicit gate."
+          },
+          {
+            "before": "recheck_path",
+            "after": "write_goal_file",
+            "reason": "The destination is rechecked immediately before writing."
+          }
+        ],
+        "terminal_state": "saved_not_started"
+      }
+    },
+    {
+      "id": "exhaustive-discovery",
+      "title": "An exhaustive request continues one question at a time until drafting is approved",
+      "category": "exhaustive",
+      "user_language": "en-GB",
+      "prompt": "/goal-workflow exhaustive: plan a full authentication migration, discuss every risk carefully",
+      "checkpoint_replies": [
+        {
+          "at": "direction_approval",
+          "content": "y"
+        },
+        {
+          "at": "first_coverage_summary",
+          "content": "y"
+        },
+        {
+          "at": "second_coverage_summary",
+          "content": "n"
+        },
+        {
+          "at": "save_approval",
+          "content": "y"
+        },
+        {
+          "at": "start_approval",
+          "content": "y"
+        }
+      ],
+      "setup": {
+        "requested_depth": "exhaustive",
+        "start_mode": "in_session",
+        "active_goal": "none",
+        "goal_file": "absent",
+        "explicit_token_budget": null
+      },
+      "expected": {
+        "mode": "exhaustive",
+        "required_behaviors": [
+          "Ask exactly one focused discovery question per turn.",
+          "Treat Unresolved as temporary and continue after the first coverage review.",
+          "Draft only after the user explicitly elects to stop exploring."
+        ],
+        "forbidden_actions": [
+          "invoke_external_skill",
+          "ask_multiple_questions",
+          "draft_before_coverage_review",
+          "write_before_save_approval",
+          "start_before_second_approval"
+        ],
+        "tool_order": [
+          {
+            "before": "choose_depth",
+            "after": "ask_question",
+            "reason": "The exhaustive depth controls the discovery loop."
+          },
+          {
+            "before": "ask_question",
+            "after": "show_coverage",
+            "reason": "Coverage is summarized after the focused interview."
+          },
+          {
+            "before": "show_coverage",
+            "after": "approve_draft",
+            "reason": "The user explicitly decides when exhaustive exploration can end."
+          },
+          {
+            "before": "approve_draft",
+            "after": "reserve_path",
+            "reason": "The final path is resolved before the complete prompt is displayed."
+          },
+          {
+            "before": "approve_start",
+            "after": "begin_execution",
+            "reason": "Execution begins after the second approval."
+          }
+        ],
+        "terminal_state": "goal_started"
+      }
+    },
+    {
+      "id": "reject-save-gate",
+      "title": "Rejecting the save gate leaves the filesystem and execution untouched",
+      "category": "reject_save",
+      "user_language": "en-US",
+      "prompt": "/goal-workflow prepare a release-readiness goal",
+      "checkpoint_replies": [
+        {
+          "at": "coverage_summary",
+          "content": "n"
+        },
+        {
+          "at": "save_approval",
+          "content": "n"
+        }
+      ],
+      "setup": {
+        "requested_depth": "standard",
+        "start_mode": "in_session",
+        "active_goal": "none",
+        "goal_file": "absent",
+        "explicit_token_budget": null
+      },
+      "expected": {
+        "mode": "standard",
+        "required_behaviors": [
+          "Revise or await feedback after the user rejects the displayed draft.",
+          "Keep the resolved path read-only, do not write the goal file, and do not ask to start execution."
+        ],
+        "forbidden_actions": [
+          "invoke_external_skill",
+          "write_goal_file",
+          "begin_execution",
+          "write_before_save_approval",
+          "start_before_second_approval"
+        ],
+        "tool_order": [
+          {
+            "before": "show_coverage",
+            "after": "reserve_path",
+            "reason": "The proposed path follows the reviewed coverage."
+          },
+          {
+            "before": "reserve_path",
+            "after": "show_draft",
+            "reason": "The displayed draft includes the exact resolved path."
+          },
+          {
+            "before": "show_draft",
+            "after": "approve_save",
+            "reason": "The user sees the complete draft before deciding."
+          }
+        ],
+        "terminal_state": "awaiting_revision"
+      }
+    },
+    {
+      "id": "reject-start-gate",
+      "title": "Rejecting start preserves the approved file without creating a goal",
+      "category": "reject_start",
+      "user_language": "en-US",
+      "prompt": "/goal-workflow define a focused dependency-upgrade goal",
+      "checkpoint_replies": [
+        {
+          "at": "coverage_summary",
+          "content": "n"
+        },
+        {
+          "at": "save_approval",
+          "content": "y"
+        },
+        {
+          "at": "start_approval",
+          "content": "n"
+        }
+      ],
+      "setup": {
+        "requested_depth": "standard",
+        "start_mode": "in_session",
+        "active_goal": "none",
+        "goal_file": "absent",
+        "explicit_token_budget": null
+      },
+      "expected": {
+        "mode": "standard",
+        "required_behaviors": [
+          "Write the approved file atomically after checking the path.",
+          "Report the saved path and stop when start approval is negative."
+        ],
+        "forbidden_actions": [
+          "invoke_external_skill",
+          "begin_execution",
+          "handoff_to_new_session",
+          "start_before_second_approval"
+        ],
+        "tool_order": [
+          {
+            "before": "reserve_path",
+            "after": "show_draft",
+            "reason": "Path resolution and the initial collision check precede save approval."
+          },
+          {
+            "before": "show_draft",
+            "after": "approve_save",
+            "reason": "The exact content and path are shown before the first gate."
+          },
+          {
+            "before": "approve_save",
+            "after": "recheck_path",
+            "reason": "The path is checked again immediately before writing."
+          },
+          {
+            "before": "recheck_path",
+            "after": "write_goal_file",
+            "reason": "The atomic write follows the final collision check."
+          },
+          {
+            "before": "write_goal_file",
+            "after": "approve_start",
+            "reason": "The second gate is presented only after a successful save."
+          }
+        ],
+        "terminal_state": "saved_not_started"
+      }
+    },
+    {
+      "id": "conflicting-active-goal",
+      "title": "A conflicting active goal requires an explicit lifecycle decision",
+      "category": "conflicting_goal",
+      "user_language": "en-US",
+      "prompt": "/goal-workflow replace the storage layer",
+      "checkpoint_replies": [],
+      "setup": {
+        "requested_depth": "auto",
+        "start_mode": "in_session",
+        "active_goal": "conflicting",
+        "goal_file": "absent",
+        "explicit_token_budget": null
+      },
+      "expected": {
+        "mode": "standard",
+        "required_behaviors": [
+          "Explain the conflict and present numbered draft-for-later, cancel, and resolve-the-active-goal choices.",
+          "Do not abandon, pause, or complete the in-progress goal without explicit user direction, and re-confirm its state from the conversation and file rather than claiming it changed."
+        ],
+        "forbidden_actions": [
+          "invoke_external_skill",
+          "abandon_active_goal",
+          "pause_active_goal",
+          "complete_active_goal",
+          "begin_execution"
+        ],
+        "tool_order": [
+          {
+            "before": "check_active_goal",
+            "after": "present_goal_conflict_choices",
+            "reason": "The conflict is discovered before choices are offered."
+          },
+          {
+            "before": "present_goal_conflict_choices",
+            "after": "choose_depth",
+            "reason": "Discovery may begin only after the user resolves the conflict."
+          }
+        ],
+        "terminal_state": "waiting_on_conflict"
+      }
+    },
+    {
+      "id": "handoff-to-new-session",
+      "title": "A later-session preference produces an exact new-session handoff",
+      "category": "handoff",
+      "user_language": "en-US",
+      "prompt": "/goal-workflow plan a minimal observability improvement and hand it off to run later",
+      "checkpoint_replies": [
+        {
+          "at": "coverage_summary",
+          "content": "n"
+        },
+        {
+          "at": "save_approval",
+          "content": "y"
+        },
+        {
+          "at": "start_approval",
+          "content": "y"
+        }
+      ],
+      "setup": {
+        "requested_depth": "standard",
+        "start_mode": "handoff",
+        "active_goal": "none",
+        "goal_file": "absent",
+        "explicit_token_budget": null
+      },
+      "expected": {
+        "mode": "standard",
+        "required_behaviors": [
+          "Complete discovery and both approval gates before any handoff.",
+          "Return the exact 'Follow the saved goal file at <path>' message to paste into a new Claude Code session after start approval."
+        ],
+        "forbidden_actions": [
+          "invoke_external_skill",
+          "begin_execution",
+          "start_before_second_approval"
+        ],
+        "tool_order": [
+          {
+            "before": "approve_save",
+            "after": "recheck_path",
+            "reason": "The file gate is independent of how the goal is later started."
+          },
+          {
+            "before": "recheck_path",
+            "after": "write_goal_file",
+            "reason": "The final collision check precedes the atomic write."
+          },
+          {
+            "before": "write_goal_file",
+            "after": "approve_start",
+            "reason": "The handoff gate occurs after the file is saved."
+          },
+          {
+            "before": "approve_start",
+            "after": "handoff_to_new_session",
+            "reason": "The handoff message replaces in-session execution only after approval."
+          }
+        ],
+        "terminal_state": "handoff_prepared"
+      }
+    },
+    {
+      "id": "goal-file-collision",
+      "title": "An existing path is never overwritten without a new explicit decision",
+      "category": "path_collision",
+      "user_language": "en-US",
+      "prompt": "/goal-workflow plan the API cleanup and save it as 2026-07-10-api-cleanup.md",
+      "checkpoint_replies": [
+        {
+          "at": "coverage_summary",
+          "content": "n"
+        }
+      ],
+      "setup": {
+        "requested_depth": "standard",
+        "start_mode": "in_session",
+        "active_goal": "none",
+        "goal_file": "exists",
+        "explicit_token_budget": null
+      },
+      "expected": {
+        "mode": "standard",
+        "required_behaviors": [
+          "Detect the collision while resolving the path before showing the draft.",
+          "Recheck the selected path immediately before any later atomic write.",
+          "Offer a new path or an explicit overwrite decision one question at a time."
+        ],
+        "forbidden_actions": [
+          "invoke_external_skill",
+          "overwrite_goal_file",
+          "write_goal_file",
+          "show_draft",
+          "begin_execution"
+        ],
+        "tool_order": [
+          {
+            "before": "show_coverage",
+            "after": "reserve_path",
+            "reason": "Initial path resolution follows discovery and precedes the draft."
+          },
+          {
+            "before": "reserve_path",
+            "after": "prompt_path_collision",
+            "reason": "The collision is reported before any write is attempted."
+          }
+        ],
+        "terminal_state": "path_collision_prompt"
+      }
+    },
+    {
+      "id": "japanese-user-language",
+      "title": "A non-Chinese user receives the entire workflow in their language",
+      "category": "non_chinese",
+      "user_language": "ja-JP",
+      "prompt": "/goal-workflow このリポジトリの認証処理を安全に整理したい",
+      "checkpoint_replies": [],
+      "setup": {
+        "requested_depth": "auto",
+        "start_mode": "in_session",
+        "active_goal": "none",
+        "goal_file": "absent",
+        "explicit_token_budget": null
+      },
+      "expected": {
+        "mode": "standard",
+        "required_behaviors": [
+          "Restate the intent and ask the first question in Japanese.",
+          "Localize approval prompts instead of emitting fixed Chinese templates."
+        ],
+        "forbidden_actions": [
+          "invoke_external_skill",
+          "change_language",
+          "ask_multiple_questions",
+          "set_unrequested_token_budget"
+        ],
+        "tool_order": [
+          {
+            "before": "check_active_goal",
+            "after": "choose_depth",
+            "reason": "State and depth are established before interviewing."
+          },
+          {
+            "before": "choose_depth",
+            "after": "ask_question",
+            "reason": "The first localized question follows mode selection."
+          }
+        ],
+        "terminal_state": "awaiting_question"
+      }
+    },
+    {
+      "id": "explicit-token-budget",
+      "title": "An explicitly requested token budget is recorded and applied at execution start",
+      "category": "token_budget",
+      "user_language": "en-US",
+      "prompt": "/goal-workflow use a 24000 token budget to plan and execute the database migration",
+      "checkpoint_replies": [
+        {
+          "at": "coverage_summary",
+          "content": "n"
+        },
+        {
+          "at": "save_approval",
+          "content": "y"
+        },
+        {
+          "at": "start_approval",
+          "content": "y"
+        }
+      ],
+      "setup": {
+        "requested_depth": "standard",
+        "start_mode": "in_session",
+        "active_goal": "none",
+        "goal_file": "absent",
+        "explicit_token_budget": 24000
+      },
+      "expected": {
+        "mode": "standard",
+        "required_behaviors": [
+          "Preserve the explicit 24000 token budget in the saved Execution Options section.",
+          "Apply token_budget 24000 when execution begins after both approvals."
+        ],
+        "forbidden_actions": [
+          "invoke_external_skill",
+          "drop_explicit_token_budget",
+          "write_before_save_approval",
+          "start_before_second_approval"
+        ],
+        "tool_order": [
+          {
+            "before": "approve_save",
+            "after": "recheck_path",
+            "reason": "The requested budget does not weaken the save gate."
+          },
+          {
+            "before": "recheck_path",
+            "after": "write_goal_file",
+            "reason": "The atomic write follows the final collision check."
+          },
+          {
+            "before": "write_goal_file",
+            "after": "approve_start",
+            "reason": "The saved prompt remains the source of truth."
+          },
+          {
+            "before": "approve_start",
+            "after": "begin_execution_with_budget",
+            "reason": "The explicit budget is applied only when approved execution begins."
+          }
+        ],
+        "terminal_state": "goal_started"
+      }
+    },
+    {
+      "id": "verification-integrity",
+      "title": "Verification preserves producer status and rejects uncalibrated log heuristics",
+      "category": "verification_integrity",
+      "user_language": "en-US",
+      "prompt": "/goal-workflow fast: define a Goal for verifying a XeLaTeX appendix. The authoritative producer is `latexmk -xelatex -interaction=nonstopmode -halt-on-error appendix.tex`, currently proposed as `latexmk -xelatex -interaction=nonstopmode -halt-on-error appendix.tex | tee build.out` followed by `! rg '^!' appendix.log`. A stale failing `appendix.log` predates this run. A fresh successful log can contain an Underfull warning whose wrapped monospace continuation begins `!\\left...`; a real-error sample contains `! Undefined control sequence.`. Require exact verification commands and calibrate any secondary detector against both samples.",
+      "checkpoint_replies": [
+        {
+          "at": "coverage_summary",
+          "content": "n"
+        },
+        {
+          "at": "save_approval",
+          "content": "y"
+        },
+        {
+          "at": "start_approval",
+          "content": "n"
+        }
+      ],
+      "setup": {
+        "requested_depth": "fast",
+        "start_mode": "in_session",
+        "active_goal": "none",
+        "goal_file": "absent",
+        "explicit_token_budget": null
+      },
+      "expected": {
+        "mode": "fast",
+        "required_behaviors": [
+          "Require the producer latexmk command itself to exit successfully, preserving its exit status instead of replacing it with a later log scan.",
+          "Remove or isolate prior artifacts and inspect only a fresh log produced by the same production invocation.",
+          "Calibrate any secondary detector so the benign `!\\left...` sample passes and the real `! Undefined control sequence.` sample fails.",
+          "Preserve producer failures through every pipeline and distinguish search outcomes `match`, `no match`, and `search/read error`.",
+          "Treat missing, stale, unreadable, truncated, or otherwise inconclusive evidence as verification failure.",
+          "Do not infer a TeX error from every bang-prefixed line; use producer-native status or a TeX-aware calibrated check."
+        ],
+        "forbidden_actions": [
+          "invoke_external_skill",
+          "accept_uncalibrated_text_matcher",
+          "classify_any_bang_prefixed_line_as_tex_error",
+          "ignore_producer_exit_status",
+          "reuse_stale_verification_artifact",
+          "treat_inconclusive_evidence_as_success",
+          "write_before_save_approval",
+          "begin_execution",
+          "start_before_second_approval"
+        ],
+        "tool_order": [
+          {
+            "before": "inspect_context",
+            "after": "inspect_verification_oracle",
+            "reason": "The producer and existing artifacts are inspected before the verification oracle is accepted."
+          },
+          {
+            "before": "inspect_verification_oracle",
+            "after": "calibrate_verification_oracle",
+            "reason": "The proposed oracle is understood before its positive and benign samples are calibrated."
+          },
+          {
+            "before": "calibrate_verification_oracle",
+            "after": "show_coverage",
+            "reason": "Verification integrity is resolved before the coverage summary and draft."
+          },
+          {
+            "before": "approve_save",
+            "after": "recheck_path",
+            "reason": "Saving remains behind the first approval gate."
+          },
+          {
+            "before": "recheck_path",
+            "after": "write_goal_file",
+            "reason": "The approved file is written only after the collision recheck."
+          },
+          {
+            "before": "write_goal_file",
+            "after": "approve_start",
+            "reason": "The saved verification contract precedes the second gate."
+          }
+        ],
+        "terminal_state": "saved_not_started"
+      }
+    }
+  ]
+}
