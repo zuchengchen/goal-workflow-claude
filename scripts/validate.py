@@ -12,6 +12,7 @@ by scripts/run-evals.sh against a live model.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import re
 import stat
@@ -708,9 +709,16 @@ def validate_repository(root: Path, checks: Checks) -> None:
             for line in gitignore.splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         }
+        # Goal files land in the working directory under a dated name, so the
+        # ignore rule is a name pattern rather than a directory. Any pattern
+        # that actually matches one is accepted; the exact glob is not fixed.
         checks.require(
-            ".claude/goals/" in ignore_lines,
-            f"{gitignore_path} must ignore .claude/goals/",
+            any(
+                fnmatch.fnmatch("2026-07-28-example-goal.md", pattern.lstrip("/"))
+                for pattern in ignore_lines
+            ),
+            f"{gitignore_path} must ignore dated goal files written by the skill, "
+            f"for example /20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.md",
         )
         checks.require(
             "__pycache__/" in ignore_lines,

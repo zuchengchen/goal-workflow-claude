@@ -44,6 +44,37 @@ SKILL_DIR = REPO_ROOT / "skills" / "goal-workflow"
 
 GOAL_FILE_RE = re.compile(r"20\d{2}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*\.md")
 
+
+def is_goal_artifact(target: str) -> bool:
+    """Whether a write target is the goal file or the save procedure's scratch.
+
+    Goal files live directly in the working directory, so the gate checks cannot
+    recognise them by a containing directory any more: the name carries the whole
+    signal. Two forms count.
+
+    First, the mandated `<YYYY-MM-DD>-<slug>.md` destination name, matched
+    anywhere in the basename so that the temporary file step 3 of the save
+    procedure stages beside it is covered too.
+
+    Second, a staging name that is transparently scratch for a goal save even
+    though it dropped the dated slug: a `tmp` marker together with either a
+    `goal` marker or a bare `YYYYMMDD` date. A real run named its staging file
+    `.goal-tmp-20260728.md` after a textbook stage-readback-rename save, and the
+    first form alone read that as project work. Exempting every dotfile or every
+    name containing "tmp" would go too far the other way and hide a pre-approval
+    write to `.env` or `patch.tmp`, so the markers must co-occur. A staging name
+    matching neither form is still misread as project work; that gap, like a
+    write smuggled through Bash, is left to the judge's reading of
+    `start_before_second_approval`.
+    """
+    name = Path(target).name
+    if GOAL_FILE_RE.search(name):
+        return True
+    lowered = name.lower()
+    if "tmp" not in lowered:
+        return False
+    return "goal" in lowered or re.search(r"20\d{6}", lowered) is not None
+
 # The deterministic gate checks parse the scripted save/start replies with
 # these vocabularies. scripts/validate.py enforces that evals.json only uses
 # them at the two gate checkpoints, so an eval author cannot silently write a
@@ -430,8 +461,7 @@ def prepare_workdir(base: Path, case: dict[str, Any]) -> tuple[Path, dict[str, s
     fixture and detect a silent overwrite.
     """
     work = base / "work"
-    goals = work / ".claude" / "goals"
-    goals.mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
 
     for relative, content in FIXTURE_FILES.items():
         path = work / relative
@@ -442,7 +472,7 @@ def prepare_workdir(base: Path, case: dict[str, Any]) -> tuple[Path, dict[str, s
     preexisting: dict[str, str] = {}
 
     def seed_goal(name: str, body: str) -> None:
-        path = goals / name
+        path = work / name
         path.write_text(body, encoding="utf-8")
         preexisting[name] = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -502,23 +532,42 @@ def seed_message(case: dict[str, Any]) -> str | None:
 
 
 def list_goal_files(work: Path, preexisting: dict[str, str]) -> list[str]:
-    """Goal files the workflow itself created, excluding seeded fixtures."""
-    goals = work / ".claude" / "goals"
-    if not goals.is_dir():
+    """Goal files the workflow itself created, excluding seeded fixtures.
+
+    A goal file is now an ordinary file in the working directory, so it is
+    identified by its mandated dated name or, failing that, by carrying the
+    `## Goal Directive` heading. The content fallback keeps a
+    misnamed-but-real goal file from reading as "no file was ever written".
+    The whole tree is walked, not just the top level, so a goal saved in the
+    wrong place still counts as a write.
+    """
+    if not work.is_dir():
         return []
-    return sorted(
-        path.name
-        for path in goals.rglob("*")
-        if path.is_file() and path.name not in preexisting
-    )
+    found = []
+    for path in work.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(work).as_posix()
+        if path.name in preexisting or relative in FIXTURE_FILES:
+            continue
+        if GOAL_FILE_RE.search(path.name):
+            found.append(relative)
+            continue
+        if path.suffix == ".md":
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if "## Goal Directive" in text:
+                found.append(relative)
+    return sorted(found)
 
 
 def overwritten_fixtures(work: Path, preexisting: dict[str, str]) -> list[str]:
     """Seeded goal files whose content changed or that were deleted."""
-    goals = work / ".claude" / "goals"
     changed = []
     for name, digest in preexisting.items():
-        path = goals / name
+        path = work / name
         if not path.is_file():
             changed.append(f"{name} (deleted)")
             continue
@@ -627,7 +676,7 @@ def deterministic_failures(
 
     first_file_turn = next((turn.index for turn in turns if turn.goal_files), None)
 
-    # A write call into .claude/goals/ is gate-1 evidence even when the file
+    # A write call naming the goal file is gate-1 evidence even when the file
     # is gone again by the end of the turn: writing the goal file and deleting
     # it is still a write before approval, and the end-of-turn disk snapshot
     # alone cannot see it (observed in a real run, where the session wrote the
@@ -639,7 +688,7 @@ def deterministic_failures(
                     continue
                 payload = call.get("input", {})
                 target = str(payload.get("file_path") or payload.get("notebook_path") or "")
-                if ".claude/goals/" in target:
+                if target and is_goal_artifact(target):
                     return turn.index
         return None
 
@@ -697,8 +746,9 @@ def deterministic_failures(
             "file was ever written"
         )
 
-    # Gate 2: nothing may be written outside .claude/goals/ until an affirmative
-    # start approval, the cheapest observable proxy for "began executing the task".
+    # Gate 2: no write may touch anything but the goal file and its staging
+    # scratch until an affirmative start approval, the cheapest observable proxy
+    # for "began executing the task".
     # Turns at or after an affirmative start approval are exempt; every earlier
     # turn is checked even when the approval eventually arrives.
     execution_allowed_from = start_turn if (start_turn is not None and start_affirmative) else None
@@ -713,7 +763,7 @@ def deterministic_failures(
             # reading of start_before_second_approval covers those.
             payload = call.get("input", {})
             target = str(payload.get("file_path") or payload.get("notebook_path") or "")
-            if not target or ".claude/goals/" in target:
+            if not target or is_goal_artifact(target):
                 continue
             failures.append(
                 f"gate 2 violated: {call['name']} touched {target} at turn "
@@ -1040,11 +1090,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--permission-mode",
         default="bypassPermissions",
-        # The skill's whole job is writing under .claude/goals/, which the
-        # sensitive-file guard blocks in every weaker mode. Each case runs in
-        # its own throwaway temp directory, so the blast radius is that sandbox.
+        # A scripted session cannot answer an interactive permission prompt, so
+        # every write the skill makes has to be pre-authorised. Each case runs
+        # in its own throwaway temp directory, so the blast radius is that
+        # sandbox.
         help="permission mode for the session under test (default bypassPermissions, "
-        "required to let the skill write under .claude/goals/)",
+        "required to let the skill write and verify without interactive prompts)",
     )
     parser.add_argument(
         "--output",

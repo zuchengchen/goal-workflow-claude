@@ -1,7 +1,7 @@
 ---
 name: goal-workflow
 description: Turn a rough task into an approved, saved, and executable Claude Code goal through adaptive brainstorming and a one-question-at-a-time discovery interview. Use when the user invokes `/goal-workflow`, asks to define or refine a durable goal, or wants explicit scope, verification, risk, file-save approval, and execution approval before work begins.
-version: 0.5.0
+version: 0.6.0
 ---
 
 # Goal Workflow
@@ -12,8 +12,8 @@ This workflow exists to enforce exactly two approval gates. Everything below is
 supporting detail; these two rules are the product.
 
 1. **Never write the goal file** until the user explicitly approves that exact
-   content at that exact absolute path. Writing a file under `.claude/goals/`
-   and deleting it again is still a write; show drafts only as message text.
+   content at that exact absolute path. Writing the goal file and deleting it
+   again is still a write; show drafts only as message text.
 2. **Never begin executing** the goal until the file is written, read back
    identical to the approved content, and the user explicitly approves starting.
 
@@ -23,7 +23,7 @@ If you are unsure whether a gate opened, it did not open.
 
 ## Purpose
 
-Turn rough intent into a concrete, executable goal, save the approved goal under the target project's `.claude/goals/` directory, obtain a second approval, and then begin executing it or hand it off.
+Turn rough intent into a concrete, executable goal, save the approved goal in the current working directory, obtain a second approval, and then begin executing it or hand it off.
 
 Keep this workflow self-contained. Do not invoke, trigger, or delegate to any external skill; apply the quality standard in this file directly.
 
@@ -64,7 +64,7 @@ If new information materially changes the objective, scope, verification, risks,
 
 ### Existing Goal
 
-At the beginning and again immediately before execution, inspect current goal state: read the conversation for a goal already being executed and check the `.claude/goals/` directory for a saved goal that this session is following.
+At the beginning and again immediately before execution, inspect current goal state: read the conversation for a goal already being executed and check the working directory for a saved goal file that this session is following.
 
 - If no goal is being executed, continue.
 - If a matching goal is already being executed, ask whether to continue it, prepare a revised successor, or cancel this workflow. Continuing the existing goal exits this new-goal workflow without pretending that its states were traversed. Do not create a duplicate.
@@ -162,7 +162,7 @@ Apply this built-in quality standard:
 
 Resolve the save path before asking for save approval:
 
-1. Determine the target project root from reliable workspace or repository evidence. Use `<project-root>/.claude/goals/` when the root is known; otherwise use `<cwd>/.claude/goals/`.
+1. Save into the current working directory. Use `<cwd>/` unless the user explicitly names a different directory; never relocate the file to a project root, a subdirectory, or a hidden directory on your own initiative.
 2. Build `<YYYY-MM-DD>-<slug>.md`. Use a lowercase ASCII slug matching `[a-z0-9]+(?:-[a-z0-9]+)*`; transliterate or summarize non-ASCII titles, limit it to 60 characters, and use a deterministic generic slug if needed.
 3. Resolve and display an absolute normalized path. Never present `~`, a relative path, or a path whose base is ambiguous.
 4. Check whether the path already exists before approval. For a collision, recommend a new collision-free name. When the colliding path or filename was explicitly requested by the user, do not substitute a different name on your own: ask, as its own dedicated question as soon as the collision is known, whether to use a collision-free name or explicitly overwrite. Overwriting requires a separate, explicit approval tied to the exact absolute path; do not bundle overwrite consent with prompt approval and never overwrite silently.
@@ -235,14 +235,16 @@ If the user requests any change, revise the draft and ask again. Enter `draft_ap
 
 Only in `draft_approved`:
 
-1. Recheck collision state immediately before writing.
-2. Create the parent `.claude/goals/` directory if needed.
-3. Write the exact approved content to a unique temporary file in the same directory. Refuse replacement if a collision appeared and no separate overwrite approval exists.
-4. Re-read the temporary file and compare it with the approved content, then atomically rename it to the approved destination. Remove the temporary file after any failure; preserve the existing destination unless replacement was separately approved.
+1. Recheck collision state after the approval and before writing. The existence check performed earlier to resolve the path does not satisfy this step: the destination may have appeared in between, so an unrepeated earlier check is the same as no check.
+2. Create the parent directory if it does not exist. The working directory normally already exists, so this is a no-op unless the user named a different directory.
+3. Write the exact approved content to a temporary file in the same directory, named as the destination filename plus a short suffix that you generate freshly for this save. The goal file's siblings are the user's own files, so the staging name must remain recognizably derived from the destination. Refuse replacement if a collision appeared and no separate overwrite approval exists.
+4. Re-read the temporary file and compare it with the approved content, then atomically rename it to the approved destination. Use a rename that cannot clobber an existing destination unless replacement was separately approved. Remove the temporary file after any failure; preserve the existing destination unless replacement was separately approved.
 5. Re-read the destination from the absolute path and compare it with the approved content.
 6. Enter `saved` only on an exact match; otherwise report the error and remain `draft_approved`.
 
 Report the absolute path and a concise objective summary. Any content or path change after saving requires a new draft and a new save approval.
+
+The goal file's own content may be in any language the user approved, but every message about this procedure — including a remark that a readback matched or that a rename is about to happen — stays in the user's language. Do not drift into the language of the draft or of these instructions while narrating mechanical steps.
 
 ### Approve Start
 

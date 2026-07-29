@@ -16,10 +16,10 @@
 
 canonical URL 同时编码了精确 ref 和 path。canonical 安装路径不是仓库根，而是 `skills/goal-workflow`；本仓库的 moving ref 是 `master`。
 
-为保证可复现，正式环境和团队配置应优先把 URL 中的 `master` 替换为已发布 tag（当前 source 版本 `0.5.0` 发布后对应 `v0.5.0`）或完整 commit SHA：
+为保证可复现，正式环境和团队配置应优先把 URL 中的 `master` 替换为已发布 tag（当前 source 版本 `0.6.0` 发布后对应 `v0.6.0`）或完整 commit SHA：
 
 ```text
-https://github.com/zuchengchen/goal-workflow-claude/tree/v0.5.0/skills/goal-workflow
+https://github.com/zuchengchen/goal-workflow-claude/tree/v0.6.0/skills/goal-workflow
 https://github.com/zuchengchen/goal-workflow-claude/tree/<full-commit-sha>/skills/goal-workflow
 ```
 
@@ -59,7 +59,7 @@ git clone --depth 1 https://github.com/zuchengchen/goal-workflow-claude.git "$tm
 rm -rf -- "$tmp_dir"
 ```
 
-安装脚本会先校验 skill 结构，目标已存在时停止且不覆盖；更新已有安装改用 `"$tmp_dir/scripts/install-local.sh" --replace`（保留备份，见「更新」）。需要固定版本时，把 clone 命令改为 `git clone --branch v0.5.0 --depth 1 …` 再执行安装脚本。安装完成后启动新的 Claude Code 会话，确认 `/goal-workflow` 出现。
+安装脚本会先校验 skill 结构，目标已存在时停止且不覆盖；更新已有安装改用 `"$tmp_dir/scripts/install-local.sh" --replace`（保留备份，见「更新」）。需要固定版本时，把 clone 命令改为 `git clone --branch v0.6.0 --depth 1 …` 再执行安装脚本。安装完成后启动新的 Claude Code 会话，确认 `/goal-workflow` 出现。
 
 ## 方法一：从本地仓库直接复制
 
@@ -84,7 +84,7 @@ scripts/install-local.sh --dest "/path/to/target-project/.claude/skills/goal-wor
 ```bash
 install_root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
 dest="$install_root/goal-workflow"
-ref="v0.5.0"
+ref="v0.6.0"
 tmp_dir="$(mktemp -d)"
 source_dir="$tmp_dir/goal-workflow"
 
@@ -118,7 +118,7 @@ ref="0123456789abcdef0123456789abcdef01234567"
 
 ```bash
 git clone https://github.com/zuchengchen/goal-workflow-claude.git /path/to/goal-workflow-source
-git -C /path/to/goal-workflow-source checkout --detach v0.5.0
+git -C /path/to/goal-workflow-source checkout --detach v0.6.0
 ```
 
 然后用仓库自带的安全安装脚本把 canonical skill 复制到目标项目：
@@ -200,7 +200,7 @@ dest="/path/to/target-project/.claude/skills/goal-workflow"
 
 ```bash
 git -C /path/to/goal-workflow-source fetch --tags origin
-git -C /path/to/goal-workflow-source checkout --detach v0.5.0
+git -C /path/to/goal-workflow-source checkout --detach v0.6.0
 ```
 
 然后按复制步骤更新安装目录。跟随 moving ref 时可以改为：
@@ -212,10 +212,10 @@ git -C /path/to/goal-workflow-source pull --ff-only origin master
 
 ### Goal 文件位置
 
-新 goal 文件默认保存到项目根 `.claude/goals/`；无法确定项目根时使用当前工作目录下的 `.claude/goals/`。是否纳入版本控制由项目决定：
+新 goal 文件默认保存到当前工作目录，文件名为 `<YYYY-MM-DD>-<slug>.md`，例如 `2026-07-28-api-cleanup.md`。除用户在对话中显式指定其他目录外，skill 不会自行改放位置。是否纳入版本控制由项目决定：
 
-- 个人工作用 goal：通常在 `.gitignore` 中加入 `.claude/goals/`。
-- 团队共享 goal：不要忽略该目录，审阅后显式提交所需文件。
+- 个人工作用 goal：通常在 `.gitignore` 中忽略该文件名模式，例如 `/20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.md`。
+- 团队共享 goal：不要忽略，审阅后显式提交所需文件。
 
 ## 卸载
 
@@ -272,7 +272,7 @@ grep '^version:' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/goal-workflow/SKILL
 
 ### 保存 goal 文件时出现权限提示
 
-goal 文件写入目标项目的 `.claude/goals/`。在默认权限模式下，Claude Code 对 `.claude/` 内文件的写入不会自动放行（本仓库的 eval harness 因此以 `--permission-mode bypassPermissions` 在一次性临时目录中运行，见 tests/README.md）。因此第一道审批通过、skill 实际写盘时，会再出现一次工具权限确认——这是 Claude Code 的防护行为，不是 skill 故障，放行即可。若希望在某个项目中长期免提示，可在该项目 `.claude/settings.json` 的 `permissions.allow` 中加入形如 `Write(.claude/goals/**)` 的规则，具体语法以所用 Claude Code 版本的权限文档为准。无头或自动化环境需要显式选择合适的权限模式。
+goal 文件写入当前工作目录。在默认权限模式下，Claude Code 的写入工具本身需要确认，因此第一道审批通过、skill 实际写盘时会再出现一次工具权限确认——这是 Claude Code 的防护行为，不是 skill 故障，放行即可。若希望在某个项目中长期免提示，可在该项目 `.claude/settings.json` 的 `permissions.allow` 中加入形如 `Write(20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.md)` 的规则，具体语法以所用 Claude Code 版本的权限文档为准。无头或自动化环境需要显式选择合适的权限模式（本仓库的 eval harness 因此以 `--permission-mode bypassPermissions` 在一次性临时目录中运行，见 tests/README.md）。
 
 ### 是否需要安装其他 skill
 

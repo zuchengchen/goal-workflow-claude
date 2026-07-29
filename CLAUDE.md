@@ -39,4 +39,4 @@ Pull requests should explain the behavioral change, list affected skill or tooli
 
 ## Security & Repository Hygiene
 
-Do not commit credentials, tokens, local goal files, caches, or generated install artifacts. `.claude/goals/`, `__pycache__/`, and `tests/results/` are intentionally ignored. Preserve unrelated worktree changes, and do not add extra files to the canonical skill bundle unless the validator and installation contract are updated deliberately.
+Do not commit credentials, tokens, local goal files, caches, or generated install artifacts. Dated goal files in the repository root, `__pycache__/`, and `tests/results/` are intentionally ignored. Preserve unrelated worktree changes, and do not add extra files to the canonical skill bundle unless the validator and installation contract are updated deliberately.

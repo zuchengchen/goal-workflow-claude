@@ -84,6 +84,7 @@
         "mode": "fast",
         "required_behaviors": [
           "State the narrow assumed approach and ask only high-risk missing questions.",
+          "Resolve the save path to a dated Markdown file directly in the current working directory, not inside a subdirectory or a hidden directory.",
           "Show the draft and obtain separate save and start approvals.",
           "Begin executing the goal only after the saved file exists and start approval is affirmative."
         ],

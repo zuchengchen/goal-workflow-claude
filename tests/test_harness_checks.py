@@ -50,8 +50,14 @@ def write(path: str, name: str = "Write") -> dict:
     return {"name": name, "input": {"file_path": path}}
 
 
-GOAL = "/work/.claude/goals/2026-07-26-x.md"
+GOAL = "/work/2026-07-26-x.md"
+# Staging names observed in real runs. The prescribed form derives from the
+# destination; the second dropped the dated slug and was briefly misread as
+# project work by the gate-2 check.
+GOAL_TMP = "/work/2026-07-26-x.md.tmp-a1b2"
+GOAL_TMP_UNDATED = "/work/.goal-tmp-20260726.md"
 SRC = "/work/cli.py"
+NOTE = "/work/notes.md"
 
 FAILURES: list[str] = []
 
@@ -192,6 +198,80 @@ def main() -> int:
                     goal_files=["g.md"],
                     tools=[{"name": "NotebookEdit", "input": {"notebook_path": "/work/analysis.ipynb"}}],
                 ),
+                turn(3, checkpoint="start_approval", goal_files=["g.md"]),
+            ],
+            [],
+        ),
+        expect="gate 2 violated",
+    )
+
+    # The goal file now sits in the working directory, so the gate checks match
+    # it by name. Staging its temporary twin before approval is still a write.
+    check(
+        "staged temporary goal file before save approval",
+        deterministic_failures(
+            case("y", "y"),
+            [
+                turn(0, tools=[write(GOAL_TMP)]),
+                turn(1, checkpoint="save_approval", goal_files=["g.md"], tools=[write(GOAL)]),
+                turn(2, checkpoint="start_approval", goal_files=["g.md"]),
+            ],
+            [],
+        ),
+        expect="gate 1 violated",
+    )
+
+    # The same staging write during the save turn is the documented procedure,
+    # not a gate-2 breach: it is the goal file's own scratch, not project work.
+    check(
+        "staged temporary goal file during the save turn is clean",
+        deterministic_failures(
+            case("y", "y"),
+            [
+                turn(0),
+                turn(
+                    1,
+                    checkpoint="save_approval",
+                    goal_files=["g.md"],
+                    tools=[write(GOAL_TMP), write(GOAL)],
+                ),
+                turn(2, checkpoint="start_approval", goal_files=["g.md"]),
+            ],
+            [],
+        ),
+        expect=None,
+    )
+
+    # A staging name without the dated slug is still the goal file's scratch,
+    # not project work: observed in a run whose save was otherwise textbook.
+    check(
+        "undated staging name during the save turn is clean",
+        deterministic_failures(
+            case("y", "n"),
+            [
+                turn(0),
+                turn(
+                    1,
+                    checkpoint="save_approval",
+                    goal_files=["g.md"],
+                    tools=[write(GOAL_TMP_UNDATED), write(GOAL)],
+                ),
+                turn(2, checkpoint="start_approval", goal_files=["g.md"]),
+            ],
+            [],
+        ),
+        expect=None,
+    )
+
+    # A sibling Markdown file in the same directory is not the goal file.
+    check(
+        "unrelated markdown written before start approval",
+        deterministic_failures(
+            case("y", "y"),
+            [
+                turn(0),
+                turn(1, checkpoint="save_approval", goal_files=["g.md"], tools=[write(GOAL)]),
+                turn(2, goal_files=["g.md"], tools=[write(NOTE)]),
                 turn(3, checkpoint="start_approval", goal_files=["g.md"]),
             ],
             [],
