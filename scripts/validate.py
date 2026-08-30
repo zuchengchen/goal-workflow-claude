@@ -640,10 +640,20 @@ def validate_text_hygiene(root: Path, checks: Checks) -> None:
     # ancestor directory happened to be named one of these, which is exactly the
     # `.claude/worktrees/<name>/` layout this project's own tooling creates: the
     # hygiene checks silently stopped running inside a worktree.
-    skip_parts = {".git", ".claude", "__pycache__"}
+    #
+    # `.claude` is not skipped wholesale. It once held only session-local
+    # settings, but `.claude/plans/` is tracked now, and CI's `git diff --check`
+    # inspects every tracked file -- skipping the directory would let a tracked
+    # file fail CI while passing here, which is exactly the superset property
+    # these checks exist to hold.
+    skip_parts = {".git", "__pycache__", "worktrees"}
+    # Git-ignored, so CI never reads it: a local permission allowlist whose
+    # formatting is Claude Code's business, not this repository's.
+    skip_files = {Path(".claude/settings.local.json")}
     results_dir = root / "tests" / "results"
     for path in root.rglob("*"):
-        if skip_parts & set(path.relative_to(root).parts):
+        relative = path.relative_to(root)
+        if skip_parts & set(relative.parts) or relative in skip_files:
             continue
         if not path.is_file() or path.is_symlink():
             continue

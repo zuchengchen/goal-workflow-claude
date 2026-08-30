@@ -40,3 +40,5 @@ Pull requests should explain the behavioral change, list affected skill or tooli
 ## Security & Repository Hygiene
 
 Do not commit credentials, tokens, local goal files, caches, or generated install artifacts. Dated goal files in the repository root, `__pycache__/`, and `tests/results/` are intentionally ignored. Preserve unrelated worktree changes, and do not add extra files to the canonical skill bundle unless the validator and installation contract are updated deliberately.
+
+`.claude/plans/` is tracked: a design note there records why a change was made and what was measured before it, which the diff cannot. `.claude/settings.local.json` stays ignored, being one machine's permission allowlist, and `.claude/worktrees/` is transient. Anything tracked under `.claude/` is subject to the same hygiene rules as the rest of the repository, because CI's `git diff --check` reads every tracked file.
