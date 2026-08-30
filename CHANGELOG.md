@@ -14,6 +14,13 @@
 - 修复备份路径遇悬空符号链接时 `[[ -e ]]` 判断为假、导致安装以未捕获的 Python 异常永久失败的问题。
 - INSTALL.md 与 README 补记 Python 3 是安装/卸载脚本的硬依赖（此前文档声称只需 Claude Code 与可选 Git，无 Python 的机器上「一句话安装」会以退出码 127 不明失败）。
 
+### Changed (评测驱动的收紧)
+
+- 密钥不变量此前读起来像「只管真实密钥」，实测中会话把 `.env` 里一个看起来无害的开发值原样抄进草稿与已保存的 goal 文件。现在明确：无论该值看起来多么无害——占位值、明显的假值、已过期的值、以及已在被检查文件里可见的值——都只按名称与获取方式引用。判断某个值「可以安全引用」不是会话的权限，且 goal 文件的存在时间长于写下它的会话。Draft 质量标准在泄漏实际发生的位置（Context 段）重复这条。
+- gate-2 曾拒绝一次正确的保存：把带日期的文件名锚定在 basename 开头，导致 `.goalstage_<目标名>.md.tmp` 不被识别为暂存，教科书式的「暂存-回读-改名」被判成审批前改动项目文件。现在允许暂存装饰出现在目标文件名之前，前提是它自己表明是暂存产物，`x2026-07-26-abc.md.bak` 等无关文件仍被拦住。
+- judge 覆盖检查连续丢弃了两份完整 verdict：一次是回显声明行为时少了一个反引号，一次是在被引用命令中插入了文件名，两次都被判为「未评分」，并把同一份 verdict 里已正确评分的条目一起作废。逐字与前缀匹配都挡不住句中漂移，因此长标签改按字符相似度识别，短标签仍要求完全一致；把声明外的行为偷换进来仍然是 harness error。
+- eval fixture 的 `.env` 不再把值标注为假值。告诉被测会话「这不是真实凭据」等于把「该值可否引用」这个判断交还给它，而那正是本用例要测的禁区——fixture 反过来替 skill 辩护了。
+
 ### Changed（行为变更）
 
 - **subagent 只读窗口收紧到 `active`**：此前只读状态列举为 `discovering`/`drafted`/`draft_approved`/`saved`，遗漏了 `start_approved`，而同一文件另一处又写「`active` 之后才可写」——两条规则在一个真实存在的窗口里给出相反答案（启动失败或冲突未解时工作流就停在 `start_approved`）。现在明确 `start_approved` 期间 subagent 仍然只读，写权限跟随 `active`。
@@ -76,6 +83,12 @@
 - harness 不再把 subagent 的最终文本计入 `assistant_text`：那是对父会话的汇报，不是用户可见消息，否则语言不变量与「一次一问」会被误判。
 - `Purpose` 段澄清「不委派外部 skill」限制的是 *skill* 而非 subagent，`active` 之前不实现任务的规则明确同样约束 subagent——可做的事才可派发。
 - `invoke_external_skill` 确定性检查同时覆盖 subagent 发起的 `Skill` 调用。
+
+### Verification (0.8.0)
+
+- 结构检查全绿：`./scripts/validate.sh`、`python3 tests/test_harness_checks.py`（18 → 61 项）、`./scripts/smoke-install.sh`、`git diff --check`。安装器与卸载器的 21 道安全守卫全部经变异测试证明可被证伪（逐一删除后 smoke 必失败）。
+- 前向测试（`--model claude-sonnet-5`，judge 同款，simulator `claude-haiku-4-5-20251001`）：`secret-reference-only`、`verification-integrity`、`goal-file-collision`、`explicit-overwrite-consent`、`localized-handoff-message` 全过，0 harness error。其中三项是先失败、按实测证据修正后复跑通过；另外独立于 judge 核对过：没有任何一次写入调用包含字面密钥值。
+- 两处破坏性安装器缺陷各自复现过一次再验证修复：`--dest <repo>/skills/goal-workflow` 此前删除 canonical bundle 并返回 0，`--dest ""` 此前误删用户级安装并返回 0。
 
 ### Verification
 
