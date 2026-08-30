@@ -40,7 +40,7 @@ This is a planning workflow until the goal becomes active. Do not implement the 
 - Inspect relevant local context before asking the user for facts that can be discovered safely.
 - Dispatch independent work in parallel, to subagents by default; see Parallelism And Delegation.
 - Do not silently expand scope or weaken verification.
-- Never copy secret values, credentials, or private tokens into the draft or saved goal file; refer to their names or retrieval mechanism instead.
+- Never copy a secret value, credential, or private token into a message, the draft, or the saved goal file; refer to its name and how it is retrieved instead. This holds however harmless the value looks: a development placeholder, an obvious dummy, an expired value, and a value already visible in an inspected file are all reproduced by name only. Judging a value safe to quote is not your call to make, and a goal file outlives the session that wrote it.
 - Verification must not pass on absent, stale, incomplete, unreadable, or indeterminate evidence, or fail on a known benign collision in the target format.
 - Do not mark a goal complete without the evidence required by its saved prompt.
 
@@ -227,6 +227,7 @@ Apply this built-in quality standard:
 - Define evidence of completion through exact commands, tests, metrics, examples, review criteria, or manual checks that satisfy Verification Integrity.
 - Make scope and out-of-scope boundaries explicit.
 - Preserve approved constraints, decisions, assumptions, unresolved mappings, risks, and external dependencies.
+- Record a secret by name and retrieval mechanism only. Evidence gathered by inspection is summarized, not pasted, wherever a secret value would otherwise be reproduced verbatim.
 - State when execution must stop and ask rather than guess.
 - Make completion impossible to claim before required verification passes, unless the user explicitly changes that standard.
 

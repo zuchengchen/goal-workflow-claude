@@ -135,6 +135,10 @@ def check_goal_artifact_names() -> None:
         "/work/2026-07-26-api-cleanup.md.tmp-a1b2",
         "/work/.goal-tmp-20260726.md",
         "/work/.2026-07-26-api-cleanup.md",
+        # Staging decoration may also precede the destination name. A live run
+        # staged exactly this and gate 2 called it a pre-approval project write.
+        "/work/.goalstage_2026-07-26-api-cleanup.md.tmp",
+        "/work/.2026-07-26-api-cleanup.md.stage",
     ]
     gated = [
         # Names once exempted by searching for the dated form anywhere in the
@@ -291,6 +295,64 @@ def check_judge_verdict_coverage() -> None:
     ]
     judge_outcome("verdict grading a tool_order pair backwards is a harness error", reordered,
                   expect_harness=True)
+
+    # Two consecutive live runs echoed a declared behavior back with a backtick
+    # dropped, then with a filename inserted inside the quoted command. Each time
+    # the whole verdict was discarded as ungradable, correctly graded behaviors
+    # and all. Recognising the label has to survive that drift.
+    long_declared = (
+        "Replace the bare negated `! rg '^!'` heuristic with producer-native status "
+        "or a TeX-aware calibrated check rather than treating every bang-prefixed "
+        "line as an error."
+    )
+    drift_case = {
+        "expected": {
+            "required_behaviors": [long_declared, "Keep asking one question at a time."],
+            "forbidden_actions": ["never_this"],
+            "tool_order": [{"before": "a", "after": "b", "reason": "because"}],
+            "terminal_state": "goal_started",
+        }
+    }
+    for label, echoed in (
+        ("a dropped backtick", long_declared.replace("'^!'`", "'^!'")),
+        ("an inserted filename", long_declared.replace("'^!'`", "'^!' appendix.log`")),
+    ):
+        drifted = complete_verdict()
+        drifted["required_behaviors"] = [
+            {"behavior": echoed, "satisfied": True, "evidence": "turn 1"},
+            {
+                "behavior": "Keep asking one question at a time.",
+                "satisfied": True,
+                "evidence": "turn 2",
+            },
+        ]
+        try:
+            failures = judge_failures(drift_case, drifted)
+            ok, detail = not failures, f"graded with {failures}"
+        except HarnessError as exc:
+            ok, detail = False, f"rejected a recognisable verdict: {exc}"
+        expect_true(f"a verdict echoing a behavior with {label} is still graded", ok, detail)
+
+    # Tolerating drift must not tolerate a behavior nobody declared.
+    substituted = complete_verdict()
+    substituted["required_behaviors"] = [
+        {"behavior": long_declared, "satisfied": True, "evidence": "turn 1"},
+        {
+            "behavior": "Delete the appendix and skip verification entirely.",
+            "satisfied": True,
+            "evidence": "turn 2",
+        },
+    ]
+    try:
+        judge_failures(drift_case, substituted)
+        swapped_ok, swapped_detail = False, "a substituted behavior was accepted as declared"
+    except HarnessError:
+        swapped_ok, swapped_detail = True, ""
+    expect_true(
+        "a verdict swapping in a different behavior is still a harness error",
+        swapped_ok,
+        swapped_detail,
+    )
 
     no_terminal = complete_verdict()
     del no_terminal["terminal_state"]
