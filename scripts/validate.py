@@ -16,6 +16,7 @@ import fnmatch
 import json
 import re
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -29,10 +30,42 @@ CANONICAL_URL_RE = re.compile(
     r"https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)"
     r"/tree/(?P<ref>[^/\s`]+)/skills/goal-workflow"
 )
-CLONE_URL_RE = re.compile(
+# Only URLs that are install instructions are held to the one-repository rule.
+# An earlier version unioned every GitHub URL in the docs, which turned any
+# legitimate unrelated link (a marketplace Action, an upstream project, an
+# issue thread) into a validation failure. A clone URL is recognized either by
+# its `.git` suffix or by sitting on a `git clone` line; a bare repository-root
+# link is deliberately not policed, because nothing distinguishes it from an
+# ordinary reference to some other project.
+DOT_GIT_URL_RE = re.compile(
+    r"https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)"
+    r"\.git(?=[\s`\"']|$)"
+)
+CLONE_COMMAND_RE = re.compile(
+    r"git\s+clone\s+(?:--[^\s]+\s+|-[^\s]+\s+)*"
     r"https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?(?=[\s`\"']|$)"
 )
 MOVING_REF = "master"
+
+# Claude Code reads a fixed set of frontmatter fields (the Agent Skills spec
+# defines name, description, license, compatibility, metadata, and the
+# experimental allowed-tools; this project adds version to trace an installed
+# bundle back to a release). The set is an allowlist rather than "required keys
+# plus anything": a client silently ignores keys it does not recognize, so a
+# typo like `descriptionn:` would install cleanly and simply never trigger.
+# Failing on the unknown key is the only place that mistake is visible.
+KNOWN_FRONTMATTER_KEYS = {
+    "name",
+    "description",
+    "version",
+    "allowed-tools",
+    "license",
+    "compatibility",
+    "metadata",
+}
+REQUIRED_FRONTMATTER_KEYS = {"name", "description"}
+
+EVAL_SCHEMA_VERSION = 4
 
 REQUIRED_EVAL_CATEGORIES = {
     "narrow",
@@ -52,8 +85,10 @@ REQUIRED_EVAL_CATEGORIES = {
 # The harness's deterministic gate checks parse the scripted replies at these
 # checkpoints mechanically (see AFFIRMATIVE_GATE_REPLIES in run_evals.py). A
 # reply outside this vocabulary would be misread as a refusal, so the schema
-# forbids it.
-GATE_CHECKPOINTS = {"save_approval", "start_approval"}
+# forbids it. overwrite_approval is a gate for the same reason as the other
+# two: consent to overwrite an existing file is read mechanically, and a
+# free-form "sure, go ahead" would be scored as a refusal.
+GATE_CHECKPOINTS = {"save_approval", "start_approval", "overwrite_approval"}
 GATE_REPLIES = {"y", "yes", "n", "no"}
 
 SEMVER = (
@@ -61,6 +96,10 @@ SEMVER = (
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 )
+
+# CommonMark allows a fence to be indented up to three spaces and to use either
+# backticks or tildes, with at least three of them.
+FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 
 
 class Checks:
@@ -150,11 +189,17 @@ def validate_frontmatter(
     metadata, body = parse_frontmatter(text, skill_path, checks)
     # version is optional so that bundles installed before it existed still
     # pass the identity checks that the replace and uninstall flows run.
+    missing_keys = REQUIRED_FRONTMATTER_KEYS - set(metadata)
     checks.require(
-        {"name", "description"} <= set(metadata) <= {"name", "description", "version"},
-        f"{skill_path} frontmatter must contain name and description, "
-        f"plus at most version",
+        not missing_keys,
+        f"{skill_path} frontmatter must contain {sorted(REQUIRED_FRONTMATTER_KEYS)}; "
+        f"missing: {sorted(missing_keys)}",
     )
+    for key in sorted(set(metadata) - KNOWN_FRONTMATTER_KEYS):
+        checks.errors.append(
+            f"{skill_path} frontmatter key {key!r} is not a recognized skill field; "
+            f"allowed keys are {sorted(KNOWN_FRONTMATTER_KEYS)}"
+        )
     checks.require(
         metadata.get("name") == SKILL_NAME,
         f"{skill_path} frontmatter name must be {SKILL_NAME!r}",
@@ -187,6 +232,48 @@ def validate_frontmatter(
     return body
 
 
+def scan_fences(body: str) -> tuple[list[bool], tuple[int, str] | None]:
+    """Track fenced-code-block state the way a Markdown renderer does.
+
+    Counting fence lines and testing the total for evenness is wrong in both
+    directions, and this document relies on the difference. A `~~~` fence was
+    not counted at all, so an unterminated one passed; and a longer fence
+    wrapping a shorter one -- exactly how SKILL.md embeds the goal template as
+    a ```md block inside a ````md block -- counted three markers and was
+    rejected as unterminated.
+
+    So the state is tracked properly: an opener records its character and run
+    length, and only a run of the same character, at least as long as the
+    opener and with nothing after it, closes the block. Everything in between
+    is content, including shorter runs of the same character.
+
+    Returns a per-line "this line is a fence delimiter or fence content" flag
+    list, and the (line number, delimiter) of an unterminated opener if any.
+    """
+    lines = body.splitlines()
+    inside: list[bool] = []
+    open_char: str | None = None
+    open_length = 0
+    open_line = 0
+    open_run = ""
+    for number, line in enumerate(lines, start=1):
+        match = FENCE_RE.match(line)
+        run = match.group("fence") if match is not None else ""
+        info = match.group("info") if match is not None else ""
+        if open_char is None:
+            if run:
+                open_char, open_length, open_line, open_run = run[0], len(run), number, run
+            inside.append(bool(run))
+            continue
+        inside.append(True)
+        # A closing fence carries no info string; a ```py line inside an open
+        # ```py block is content, not a second opener and not a close.
+        if run and run[0] == open_char and len(run) >= open_length and not info.strip():
+            open_char = None
+    unterminated = (open_line, open_run) if open_char is not None else None
+    return inside, unterminated
+
+
 def validate_skill_structure(body: str, path: Path, checks: Checks) -> None:
     """Check meaning-independent structure only.
 
@@ -197,25 +284,20 @@ def validate_skill_structure(body: str, path: Path, checks: Checks) -> None:
     """
     checks.require(bool(body.strip()), f"{path} must have a non-empty body")
 
-    fence_lines = [
-        number
-        for number, line in enumerate(body.splitlines(), start=1)
-        if line.strip().startswith("```")
-    ]
-    checks.require(
-        len(fence_lines) % 2 == 0,
-        f"{path} has an unterminated fenced code block; "
-        f"fences open/close at body lines {fence_lines}",
-    )
+    inside, unterminated = scan_fences(body)
+    if unterminated is not None:
+        open_line, open_run = unterminated
+        checks.errors.append(
+            f"{path} has an unterminated fenced code block; {open_run!r} opens at "
+            f"body line {open_line} and no later line closes it with {len(open_run)} "
+            f"or more {open_run[0]!r} characters"
+        )
 
-    depth = 0
-    headings: list[str] = []
-    for line in body.splitlines():
-        if line.strip().startswith("```"):
-            depth = 1 - depth
-            continue
-        if depth == 0 and line.startswith("#"):
-            headings.append(line)
+    headings = [
+        line
+        for line, in_fence in zip(body.splitlines(), inside)
+        if not in_fence and line.startswith("#")
+    ]
     checks.require(
         any(line.startswith("# ") for line in headings),
         f"{path} must contain a top-level heading outside a code fence",
@@ -246,12 +328,21 @@ def validate_skill_bundle(
 
 
 def require_exact_keys(
-    value: dict[str, Any], expected: set[str], label: str, checks: Checks
+    value: dict[str, Any],
+    expected: set[str],
+    label: str,
+    checks: Checks,
+    optional: set[str] | None = None,
 ) -> None:
+    optional = optional or set()
     actual = set(value)
+    missing = expected - actual
+    unknown = actual - expected - optional
     checks.require(
-        actual == expected,
-        f"{label} keys must be exactly {sorted(expected)}; got {sorted(actual)}",
+        not missing and not unknown,
+        f"{label} keys must be exactly {sorted(expected)}"
+        + (f" plus optionally {sorted(optional)}" if optional else "")
+        + f"; got {sorted(actual)}",
     )
 
 
@@ -343,10 +434,21 @@ def validate_eval_case(
         "goal_file",
         "explicit_token_budget",
     }
+    # overwrite_consent only means something for a case that pre-seeds a goal
+    # file, so it is optional rather than a key every case must spell out. The
+    # required keys are still exact: an unknown key is a typo, not a feature.
+    optional_setup_keys = {"overwrite_consent"}
     if not isinstance(setup, dict):
         checks.errors.append(f"{label}.setup must be an object")
     else:
-        require_exact_keys(setup, setup_keys, f"{label}.setup", checks)
+        require_exact_keys(
+            setup, setup_keys, f"{label}.setup", checks, optional=optional_setup_keys
+        )
+        consent = setup.get("overwrite_consent")
+        checks.require(
+            consent is None or isinstance(consent, bool),
+            f"{label}.setup.overwrite_consent must be a boolean when present",
+        )
         checks.require(
             setup.get("requested_depth") in {"auto", "fast", "standard", "exhaustive"},
             f"{label}.setup.requested_depth is invalid",
@@ -456,7 +558,10 @@ def validate_evals(path: Path, checks: Checks) -> None:
         str(path),
         checks,
     )
-    checks.require(document.get("schema_version") == 3, f"{path} schema_version must be 3")
+    checks.require(
+        document.get("schema_version") == EVAL_SCHEMA_VERSION,
+        f"{path} schema_version must be {EVAL_SCHEMA_VERSION}",
+    )
     checks.require(
         isinstance(document.get("description"), str) and bool(document.get("description", "").strip()),
         f"{path} description must be a non-empty string",
@@ -529,10 +634,18 @@ def validate_text_hygiene(root: Path, checks: Checks) -> None:
     text_names = {".gitignore", "LICENSE", "VERSION"}
     # tests/results holds generated eval reports: ignored by git, so not subject
     # to the hygiene rules that mirror `git diff --check`.
+    #
+    # The skip list is matched against the path *relative to the root*. Matching
+    # absolute path components exempted the entire checkout whenever any
+    # ancestor directory happened to be named one of these, which is exactly the
+    # `.claude/worktrees/<name>/` layout this project's own tooling creates: the
+    # hygiene checks silently stopped running inside a worktree.
     skip_parts = {".git", ".claude", "__pycache__"}
     results_dir = root / "tests" / "results"
     for path in root.rglob("*"):
-        if skip_parts & set(path.parts) or not path.is_file() or path.is_symlink():
+        if skip_parts & set(path.relative_to(root).parts):
+            continue
+        if not path.is_file() or path.is_symlink():
             continue
         if results_dir in path.parents:
             continue
@@ -579,6 +692,90 @@ def validate_text_hygiene(root: Path, checks: Checks) -> None:
         )
 
 
+def install_clone_repos(text: str) -> list[re.Match[str]]:
+    """Find the GitHub URLs that tell a reader where to clone this project from.
+
+    Scoped on purpose. Any URL ending in `.git` is an install source, and so is
+    a bare repository URL sitting on a `git clone` line. An unrelated link such
+    as https://github.com/actions/checkout is neither, and must not drag the
+    one-repository rule into a failure.
+    """
+    matches = list(DOT_GIT_URL_RE.finditer(text))
+    for line in text.splitlines():
+        # Only the clone command's source argument, not every URL that happens
+        # to share the line with it.
+        command = CLONE_COMMAND_RE.search(line)
+        if command is not None:
+            matches.append(command)
+    return matches
+
+
+def git_output(root: Path, *arguments: str) -> str | None:
+    """Run a read-only git command, or return None if it cannot be run.
+
+    Every caller treats None as "cannot tell" rather than as a failure, so a
+    missing git binary, a non-repository directory, or a git error never turns
+    into a validation error.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout
+
+
+def release_tag_exists(root: Path, tag: str) -> bool | None:
+    """Whether `tag` exists locally: True, False, or None for "cannot tell".
+
+    Entirely offline, and unable to fail for the wrong reason. INSTALL.md tells
+    users to pin a release tag, and the repository has already shipped docs
+    pinning a tag that existed nowhere but the documentation, so the tag is
+    worth checking. But absence of a tag is only evidence when tags are present
+    to begin with: git may be missing, the tree may not be a git checkout at
+    all (an extracted tarball, an installed bundle), and CI's default
+    actions/checkout runs at fetch-depth 1 with fetch-tags false, which fetches
+    no tags whatsoever. Each of those returns None, which the caller skips,
+    because the alternative is a check that fails loudest where it knows least.
+    """
+    inside = git_output(root, "rev-parse", "--is-inside-work-tree")
+    if inside is None or inside.strip() != "true":
+        return None
+    tags = git_output(root, "tag", "-l")
+    if tags is None:
+        return None
+    known = {line.strip() for line in tags.splitlines() if line.strip()}
+    if not known:
+        # No tags fetched: cannot distinguish "unreleased" from "not fetched".
+        return None
+    return tag in known
+
+
+def committed_pinned_refs(root: Path, doc_name: str) -> set[str] | None:
+    """Release refs pinned by the *committed* copy of a document.
+
+    Bumping the pin is the first step of preparing a release, so during that
+    edit the tag legitimately does not exist yet. What actually shipped broken
+    was a pin that reached a commit untagged, which is the state this
+    distinguishes: an uncommitted bump is release prep, a committed one is a
+    documented install path users can follow. None means "cannot tell".
+    """
+    text = git_output(root, "show", f"HEAD:{doc_name}")
+    if text is None:
+        return None
+    return {
+        match.group("ref")
+        for match in CANONICAL_URL_RE.finditer(text)
+        if re.fullmatch(rf"v{SEMVER}", match.group("ref"))
+    }
+
+
 def validate_install_urls(root: Path, version: str, checks: Checks) -> None:
     """Require the install docs to agree on one repository.
 
@@ -606,13 +803,12 @@ def validate_install_urls(root: Path, version: str, checks: Checks) -> None:
             f"{root / doc_name} must include the moving-source URL pinned to {MOVING_REF!r}",
         )
         repos.update(f"{m.group('owner')}/{m.group('repo')}" for m in canonical)
-        repos.update(
-            f"{m.group('owner')}/{m.group('repo')}" for m in CLONE_URL_RE.finditer(text)
-        )
+        repos.update(f"{m.group('owner')}/{m.group('repo')}" for m in install_clone_repos(text))
 
     checks.require(
         len(repos) <= 1,
-        f"install documentation must reference exactly one repository; got {sorted(repos)}",
+        f"install documentation must reference exactly one install repository; "
+        f"got {sorted(repos)}",
     )
 
     # A pinned example that names a release must name the current release,
@@ -629,8 +825,29 @@ def validate_install_urls(root: Path, version: str, checks: Checks) -> None:
         f"{root / 'INSTALL.md'} pins release {sorted(stale)} but VERSION is {version}",
     )
 
+    # Matching VERSION is not enough: the tag has to exist, or the documented
+    # reproducible install is a 404. This shipped once already (see the v0.4.0
+    # entry in CHANGELOG.md) and again for v0.7.0. Two conditions keep the check
+    # from crying wolf: the checkout must actually have tags to look at, and the
+    # pin must already be committed, since bumping it is how a release starts.
+    committed = committed_pinned_refs(root, "INSTALL.md")
+    for ref in sorted(pinned - stale):
+        if committed is not None and ref not in committed:
+            continue
+        if release_tag_exists(root, ref) is False:
+            checks.errors.append(
+                f"{root / 'INSTALL.md'} pins release {ref} but no such tag exists in "
+                f"this checkout; tag the release before documenting it as installable"
+            )
+
 
 def validate_repository(root: Path, checks: Checks) -> None:
+    if not root.is_dir():
+        # Every check below walks the tree, so there is nothing to report except
+        # the bad --root itself. Without this the first rglob raised a traceback.
+        checks.errors.append(f"repository root does not exist or is not a directory: {root}")
+        return
+
     version_path = root / "VERSION"
     version_text = checks.read_text(version_path)
     version = version_text.strip() if version_text is not None else ""
@@ -750,6 +967,11 @@ def validate_repository(root: Path, checks: Checks) -> None:
             "scripts/validate.sh",
             "scripts/smoke-install.sh",
             "git diff --check",
+            # The harness's deterministic gate checks are the only part of the
+            # eval machinery that is model-free, so they are the only part CI
+            # can run. Dropping the step is invisible otherwise: the gate checks
+            # would rot untested while validate.sh kept passing.
+            "tests/test_harness_checks.py",
         ):
             checks.require(
                 command in workflow,
