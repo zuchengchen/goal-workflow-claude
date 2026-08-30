@@ -1,7 +1,7 @@
 ---
 name: goal-workflow
 description: Turn a rough task into an approved, saved, and executable Claude Code goal through adaptive brainstorming and a one-question-at-a-time discovery interview. Use when the user invokes `/goal-workflow`, asks to define or refine a durable goal, or wants explicit scope, verification, risk, file-save approval, and execution approval before work begins.
-version: 0.7.0
+version: 0.8.0
 ---
 
 # Goal Workflow
@@ -20,6 +20,10 @@ supporting detail; these two rules are the product.
 Silence, an unrelated confirmation, approval of a design direction, approval of
 the coverage summary, and approval of an overwrite are each *not* either gate.
 If you are unsure whether a gate opened, it did not open.
+
+Overwrite consent is a third, separate decision. It never substitutes for
+either gate, neither gate implies it, and it is always its own dedicated
+question tied to one exact absolute path.
 
 ## Purpose
 
@@ -63,21 +67,31 @@ parallel. Do not serialize merely because parallel work is harder to narrate.
 
 These limits are what make delegation safe rather than a way around the gates.
 
-1. **Subagents are read-only until execution begins.** While `discovering`,
-   `drafted`, `draft_approved`, or `saved` — that is, until the second gate
-   opens and you start executing — a subagent may read files, search, and run
-   commands that do not mutate the project. It must not create, modify, delete,
-   or move any file, and must not run a command whose purpose is to change
-   state. The planning ban on implementing the task binds every subagent
-   exactly as it binds you. Subagents may write only once execution has begun
-   under `start_approved`, which is also what makes the goal `active`.
+1. **Subagents are read-only until the goal is `active`.** While `discovering`,
+   `drafted`, `draft_approved`, `saved`, or `start_approved`, a subagent may
+   read files, search, and run read-only commands. The planning ban on
+   implementing the task binds every subagent exactly as it binds you.
+   Subagents may write only once the goal is `active`. `start_approved` is not
+   enough on its own: execution can fail to start, and a conflict can hold the
+   workflow there, so the write permission follows `active` rather than the
+   approval that precedes it.
+
+   Read-only means the project working tree is unchanged: no creating,
+   modifying, deleting, or moving a file under it, no incidental build output
+   such as `__pycache__/` or a cache directory, no version-control state
+   change, and no dependency install. Scratch files in a temporary directory
+   outside the working tree are allowed. A verification command that must
+   produce artifacts to be calibrated is therefore *specified* while planning
+   and *performed* once the goal is `active`; until it has actually run,
+   present it as pending.
 2. **Only the main session touches the gates.** A subagent never shows the
    draft, never asks for save or start approval, never interprets a reply as an
    approval, and never writes the goal file. Both gates are opened by the user
    answering the main session. A subagent's report is input to your decision,
    never the decision.
-3. **Only the main session writes the goal file.** The save procedure — staging,
-   readback, rename, readback — runs in the main session, undelegated.
+3. **Only the main session writes the goal file.** Every step of the save
+   procedure in Save — collision recheck, parent directory, staging, readback,
+   rename, readback — runs in the main session, undelegated.
 4. **A subagent's claim is not evidence.** A report that a command passed proves
    nothing on its own. Verification still follows Verification Integrity: the
    command must actually have run, and its exit status, reports, and artifacts
@@ -105,16 +119,20 @@ Never skip or merge states.
 - `drafted`: show the complete proposed goal and absolute save path. No file has been written.
 - `draft_approved`: the user has explicitly approved saving that exact goal to that exact path. Any content or path change returns to `drafted` and invalidates the approval.
 - `saved`: write succeeded and a readback exactly matched the approved content. A write attempt alone is not sufficient.
-- `start_approved`: after the save, the user explicitly approved beginning execution. Declining leaves the workflow in `saved`.
+- `start_approved`: after the save, the user explicitly approved beginning execution. Declining leaves the workflow in `saved`. Subagents are still read-only here; only `active` permits a subagent write.
 - `active`: after `start_approved`, execution of the saved goal has begun in the current session, an existing matching goal was confirmed as the execution target, or the user confirmed running the handoff in a separate session.
 
-If new information materially changes the objective, scope, verification, risks, stop conditions, or path, return to `discovering` or `drafted` as appropriate. A save failure remains `draft_approved`; an execution-start failure remains `start_approved`.
+If new information materially changes the objective, scope, verification, risks, stop conditions, or path, return to `discovering` or `drafted` as appropriate. An execution-start failure remains `start_approved`.
+
+A save failure remains `draft_approved` while the approved content and path still stand, so a transient failure can be retried without re-approval. Changing either the content or the path invalidates that approval and returns to `drafted` — so a save that failed on a collision returns to `drafted` when it is resolved by choosing a different path, and stays `draft_approved` when it is resolved by obtaining overwrite consent for the same path.
 
 ## Workflow
 
 ### Existing Goal
 
 At the beginning and again immediately before execution, inspect current goal state: read the conversation for a goal already being executed and check the working directory for a saved goal file that this session is following.
+
+A dated goal file in the working directory is not by itself a goal in progress. Goal files accumulate there from earlier sessions, and this session follows one only when the conversation shows it doing so. Treat a file this session is not following as prior work: leave it untouched, never adopt it as the current goal, and let the collision rules handle it if the new path would land on it.
 
 - If no goal is being executed, continue.
 - If a matching goal is already being executed, ask whether to continue it, prepare a revised successor, or cancel this workflow. Continuing the existing goal exits this new-goal workflow without pretending that its states were traversed. Do not create a duplicate.
@@ -195,7 +213,7 @@ Treat each automated verification item as an oracle that must distinguish three 
 
 1. **Prefer the producing tool's own verdict.** Use its documented exit status and machine-readable or structured report before resorting to text matching.
 2. **Require positive evidence that the work ran.** Absence of a known error string proves nothing. When a runner can succeed with zero applicable work, assert that the expected tests or items were discovered and executed. Pair every negative assertion with positive evidence that the intended build, test, scanner, or code path actually ran.
-3. **Calibrate any text matcher.** If text matching is unavoidable, match the diagnostic record's severity, origin, delimiters, and required multiline context, not a broad prefix or keyword. Distinguish real failures from echoed input, source excerpts, wrapped continuation lines, summaries such as `0 errors`, and allowed warnings. Calibrate every nontrivial custom matcher or parser against at least one representative failure and one benign collision, including multiline, wrapped, escaped, or continuation forms when the format permits them. Never describe a calibration or verification as performed unless its commands actually ran in the current session; until then present it as pending.
+3. **Calibrate any text matcher.** If text matching is unavoidable, match the diagnostic record's severity, origin, delimiters, and required multiline context, not a broad prefix or keyword. Distinguish real failures from echoed input, source excerpts, wrapped continuation lines, summaries such as `0 errors`, and allowed warnings. Calibrate every nontrivial custom matcher or parser against at least one representative failure and one benign collision, including multiline, wrapped, escaped, or continuation forms when the format permits them. Calibration that must produce artifacts to observe is specified in the draft and performed once the goal is `active`, never during planning. Never describe a calibration or verification as performed unless its commands actually ran in the current session; until then present it as pending.
 4. **Let failures reach the exit status.** Setup, the producer, and every assertion must contribute to the final status. Preserve failures through pipelines and wrappers, and avoid early-terminating live search pipelines that can change an upstream status. Distinguish `match`, `no match`, and `search/read/parse error`. Never use a bare negated search such as `! grep` or `! rg` for an absence assertion, and never use `|| true` where it can convert an operational failure into success.
 5. **Use only complete evidence from the current run.** Use a clean or unique output location or remove prior outputs first; capture every relevant stream in stable noninteractive form; then require expected reports, logs, and artifacts to exist, be readable, be nonempty when applicable, and belong to the current target and run. Accept cached evidence only when its key or provenance is demonstrably tied to the current inputs and target.
 6. **Treat indeterminate as failed.** Missing, stale, truncated, unreadable, unparsable, or otherwise indeterminate evidence is inconclusive, never success. If a sound automated oracle cannot be defined, use an explicit manual acceptance criterion or a stop condition instead of an uncalibrated heuristic.
@@ -226,7 +244,7 @@ Draft the complete file in this form:
 
 ## Goal Directive
 
-Follow the saved goal file at `<absolute-path>`; complete the task only when all required verification passes, and stop to ask if any listed stop condition occurs.
+Follow the saved goal file at `<absolute-path>` and complete it only when all required verification passes; stop to ask if any listed stop condition occurs.
 
 ## Full Prompt
 
@@ -275,7 +293,7 @@ Follow the saved goal file at `<absolute-path>`; complete the task only when all
 Do not mark this goal complete until the objective is achieved and every required verification item passes, unless the user explicitly changes the completion standard.
 ```
 
-The `Goal Directive` must be concise enough to start execution directly or paste into a new Claude Code session; the saved file remains the detailed source of truth.
+The `Goal Directive` is the single canonical start sentence: it must be concise enough to start execution directly or paste verbatim into a new Claude Code session, and the handoff path reuses that exact sentence rather than composing a second one. The saved file remains the detailed source of truth.
 
 ### Approve Save
 
@@ -309,9 +327,9 @@ Enter `start_approved` only after an unambiguous affirmative answer. If the user
 Recheck existing goal state after entering `start_approved`.
 
 - By default, begin executing the saved goal in the current session: read the saved file as the source of truth and start the work described by its concise `Goal Directive`, provided no conflicting goal is being executed.
-- If a matching goal is already being executed, do not start a duplicate; confirm that it is the execution target.
+- If a matching goal is already being executed, do not start a duplicate; confirm that it is the execution target. The file just saved is then unused: say so, give both absolute paths, and ask whether to keep it as a successor or remove it. Never delete a file you just saved without asking.
 - If a conflict remains, use the Existing Goal rules and remain `start_approved` until resolved.
-- If the user prefers to run the goal later or in a separate session, hand off instead of executing now: provide the exact localized message to paste into a new Claude Code session, in the form `Follow the saved goal file at <absolute-path> and complete it only when all required verification passes.` Do not claim execution began until the user confirms running it or observable progress confirms it.
+- If the user prefers to run the goal later or in a separate session, hand off instead of executing now: give the saved file's `Goal Directive` verbatim as the message to paste into a new Claude Code session. Do not compose a second, differently worded start sentence. Localize the prose around it as usual; the directive's absolute path is never translated or abbreviated. Do not claim execution began until the user confirms running it or observable progress confirms it.
 - Preserve any explicitly requested `token_budget` in the saved `Execution Options` section so resumed or handed-off execution can recover it. When beginning execution of a goal whose `Execution Options` record a `token_budget`, state that execution proceeds under that budget. Never infer a token budget from interview depth, task size, or available context.
 
 Enter `active` only after in-session execution has begun, the matching goal was confirmed as the execution target, or the user confirmed running the handoff.
@@ -334,3 +352,5 @@ At completion, report the absolute goal file path, material changes, verificatio
 ## Resume Rules
 
 On a resumed conversation, reconstruct state from the conversation, file readback, and observable goal state. Never infer either approval from the presence of a file or an in-progress goal alone. If evidence is incomplete, choose the latest provable earlier state and repeat the necessary gate.
+
+Repeating the save gate against a file that already holds the approved content is not an overwrite: read it back first, and if it matches byte for byte, report that the destination already holds exactly that content and treat the save as satisfied rather than asking for overwrite consent. Ask for overwrite consent only when the existing content differs from what the user just approved.
