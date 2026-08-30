@@ -6,8 +6,85 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 SOURCE_DIR="$REPO_ROOT/skills/goal-workflow"
 VALIDATOR="$SCRIPT_DIR/validate.py"
 
+BACKUP_RETENTION=3
+
 rename_path() {
   python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$1" "$2"
+}
+
+# Make a path comparable as a string without touching the filesystem: the
+# destination may not exist yet, so symlink resolution is not available here.
+normalize_path() {
+  local path=$1
+  if [[ "$path" != /* ]]; then
+    path="$PWD/$path"
+  fi
+  while [[ "$path" == *//* ]]; do
+    path=${path//\/\//\/}
+  done
+  if [[ "$path" != "/" ]]; then
+    path=${path%/}
+  fi
+  printf '%s' "$path"
+}
+
+# Compare install paths by physical location when it exists, so a config dir
+# reached through a symlinked prefix such as /tmp still matches the resolved
+# destination parent. Falls back to lexical normalization.
+resolve_path() {
+  local path=$1
+  if [[ -d "$path" ]]; then
+    (cd "$path" && pwd -P)
+    return 0
+  fi
+  normalize_path "$path"
+}
+
+# An install tree keeps its skills directory directly inside a Claude
+# configuration directory: $CLAUDE_CONFIG_DIR, or a user- or project-level
+# .claude. Anything else is not an installation, most importantly a
+# goal-workflow source checkout whose own skills/goal-workflow is the release
+# artifact this script copies from.
+is_claude_config_dir() {
+  local candidate
+  candidate="$(normalize_path "$1")"
+  if [[ "$(basename "$candidate")" == ".claude" ]]; then
+    return 0
+  fi
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+    local configured
+    configured="$(normalize_path "$CLAUDE_CONFIG_DIR")"
+    if [[ "$candidate" == "$configured" ]]; then
+      return 0
+    fi
+    if [[ "$(resolve_path "$1")" == "$(resolve_path "$CLAUDE_CONFIG_DIR")" ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Recognize a goal-workflow source checkout by its own repository markers, so a
+# .claude path that resolves into a checkout is still refused.
+is_source_checkout() {
+  local candidate=$1
+  if [[ -f "$candidate/VERSION" && -f "$candidate/CLAUDE.md" && -f "$candidate/scripts/install-local.sh" ]]; then
+    return 0
+  fi
+  if [[ -e "$candidate/.git" && -d "$candidate/skills/goal-workflow" && -f "$candidate/scripts/uninstall-local.sh" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+default_install_hint() {
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+    printf '%s/skills/goal-workflow' "$CLAUDE_CONFIG_DIR"
+  elif [[ -n "${HOME:-}" ]]; then
+    printf '%s/.claude/skills/goal-workflow' "$HOME"
+  else
+    printf '%s' '${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/goal-workflow'
+  fi
 }
 
 usage() {
@@ -19,10 +96,15 @@ usage() {
     "Options:" \
     "  --dest PATH  Destination (default: \${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/skills/goal-workflow)" \
     "  --replace    Transactionally replace an installation and retain a backup" \
-    "  -h, --help   Show this help"
+    "  -h, --help   Show this help" \
+    "" \
+    "The destination must be a goal-workflow directory directly inside a skills" \
+    "directory of a Claude configuration directory, never a source checkout." \
+    "--replace keeps the $BACKUP_RETENTION most recent backups and prunes older ones."
 }
 
 DEST=""
+DEST_GIVEN=0
 REPLACE=0
 while (($#)); do
   case "$1" in
@@ -31,7 +113,13 @@ while (($#)); do
         printf 'ERROR: --dest requires a path\n' >&2
         exit 2
       fi
+      if [[ -z "$2" ]]; then
+        printf 'ERROR: --dest was given an empty path; pass an explicit destination such as %s\n' \
+          "$(default_install_hint)" >&2
+        exit 2
+      fi
       DEST=$2
+      DEST_GIVEN=1
       shift 2
       ;;
     --replace)
@@ -50,7 +138,7 @@ while (($#)); do
   esac
 done
 
-if [[ -z "$DEST" ]]; then
+if [[ $DEST_GIVEN -eq 0 ]]; then
   if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
     DEST="$CLAUDE_CONFIG_DIR/skills/goal-workflow"
   elif [[ -n "${HOME:-}" ]]; then
@@ -61,6 +149,10 @@ if [[ -z "$DEST" ]]; then
   fi
 fi
 
+if [[ -z "$DEST" ]]; then
+  printf 'ERROR: refusing unsafe install destination: %s\n' "$DEST" >&2
+  exit 2
+fi
 if [[ "$(basename "$DEST")" != "goal-workflow" ]]; then
   printf 'ERROR: destination directory must be named goal-workflow: %s\n' "$DEST" >&2
   exit 2
@@ -79,6 +171,13 @@ if [[ "$DEST_PARENT" == "/" || "$(basename "$DEST_PARENT")" != "skills" ]]; then
   printf 'ERROR: destination must be directly inside a non-root skills directory: %s\n' "$DEST" >&2
   exit 2
 fi
+DEST_ROOT="$(dirname "$DEST_PARENT")"
+if ! is_claude_config_dir "$DEST_ROOT" || is_source_checkout "$DEST_ROOT"; then
+  printf 'ERROR: destination is not inside a Claude configuration directory: %s\n' "$DEST" >&2
+  printf 'HINT: install into a CLAUDE_CONFIG_DIR or .claude skills directory, for example %s\n' \
+    "$(default_install_hint)" >&2
+  exit 2
+fi
 python3 "$VALIDATOR" --skill-dir "$SOURCE_DIR" --installed-only >/dev/null
 
 mkdir -p "$DEST_PARENT"
@@ -86,6 +185,13 @@ DEST_PARENT="$(cd "$DEST_PARENT" && pwd -P)"
 DEST="$DEST_PARENT/goal-workflow"
 if [[ "$DEST_PARENT" == "/" || "$(basename "$DEST_PARENT")" != "skills" ]]; then
   printf 'ERROR: destination must be directly inside a non-root skills directory: %s\n' "$DEST" >&2
+  exit 2
+fi
+DEST_ROOT="$(dirname "$DEST_PARENT")"
+if ! is_claude_config_dir "$DEST_ROOT" || is_source_checkout "$DEST_ROOT"; then
+  printf 'ERROR: resolved destination is not inside a Claude configuration directory: %s\n' "$DEST" >&2
+  printf 'HINT: install into a CLAUDE_CONFIG_DIR or .claude skills directory, for example %s\n' \
+    "$(default_install_hint)" >&2
   exit 2
 fi
 if [[ -L "$DEST" ]]; then
@@ -142,7 +248,7 @@ if [[ -e "$DEST" ]]; then
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   BACKUP_PATH="$DEST_PARENT/goal-workflow.backup.$timestamp.$$"
   suffix=0
-  while [[ -e "$BACKUP_PATH" ]]; do
+  while [[ -e "$BACKUP_PATH" || -L "$BACKUP_PATH" ]]; do
     suffix=$((suffix + 1))
     BACKUP_PATH="$DEST_PARENT/goal-workflow.backup.$timestamp.$$.${suffix}"
   done
@@ -156,4 +262,37 @@ COMMITTED=1
 printf 'Installed goal-workflow at %s\n' "$DEST"
 if [[ -n "$BACKUP_PATH" ]]; then
   printf 'Previous installation retained at %s\n' "$BACKUP_PATH"
+fi
+
+# Every --replace leaves a full copy of the previous installation behind, and a
+# stale copy still looks installed. Keep the newest BACKUP_RETENTION and prune
+# the rest, reporting each removal so nothing disappears silently.
+shopt -s nullglob
+BACKUPS=("$DEST_PARENT"/goal-workflow.backup.*)
+shopt -u nullglob
+if ((${#BACKUPS[@]} > BACKUP_RETENTION)); then
+  # The timestamp is fixed-width, so a lexical sort is chronological and the
+  # newest entries land last. Slice rather than `head -n -N`, which is a GNU
+  # extension.
+  SORTED=()
+  while IFS= read -r line; do
+    SORTED+=("$line")
+  done < <(printf '%s\n' "${BACKUPS[@]}" | sort)
+  PRUNE_COUNT=$((${#SORTED[@]} - BACKUP_RETENTION))
+  for backup in "${SORTED[@]:0:$PRUNE_COUNT}"; do
+    # The backup this run just created is reported as retained; never prune it,
+    # even if a same-second sibling sorts after it.
+    if [[ -n "$BACKUP_PATH" && "$backup" == "$BACKUP_PATH" ]]; then
+      continue
+    fi
+    if [[ -L "$backup" || ! -d "$backup" ]]; then
+      printf 'Kept unexpected non-directory backup entry %s\n' "$backup"
+      continue
+    fi
+    if rm -rf "$backup"; then
+      printf 'Pruned old backup %s\n' "$backup"
+    else
+      printf 'WARNING: could not prune old backup %s\n' "$backup" >&2
+    fi
+  done
 fi
