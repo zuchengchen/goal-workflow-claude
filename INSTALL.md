@@ -16,10 +16,10 @@
 
 canonical URL 同时编码了精确 ref 和 path。canonical 安装路径不是仓库根，而是 `skills/goal-workflow`；本仓库的 moving ref 是 `master`。
 
-为保证可复现，正式环境和团队配置应优先把 URL 中的 `master` 替换为已发布 tag（当前 source 版本 `0.7.0` 发布后对应 `v0.7.0`）或完整 commit SHA：
+为保证可复现，正式环境和团队配置应优先把 URL 中的 `master` 替换为已发布 tag（当前 source 版本 `0.8.0` 发布后对应 `v0.8.0`）或完整 commit SHA：
 
 ```text
-https://github.com/zuchengchen/goal-workflow-claude/tree/v0.7.0/skills/goal-workflow
+https://github.com/zuchengchen/goal-workflow-claude/tree/v0.8.0/skills/goal-workflow
 https://github.com/zuchengchen/goal-workflow-claude/tree/<full-commit-sha>/skills/goal-workflow
 ```
 
@@ -28,6 +28,12 @@ https://github.com/zuchengchen/goal-workflow-claude/tree/<full-commit-sha>/skill
 ## 前置条件
 
 需要支持 Agent Skills 的 Claude Code。skill 本身是自包含的，不依赖任何外部 skill，也不依赖 npm、pip、Go、Rust 包。
+
+安装与卸载脚本另需 Python 3：`scripts/install-local.sh` 和 `scripts/uninstall-local.sh` 用它解析路径并做原子改名。方法一、方法零都会用到；方法二的手动复制流程不需要 Python。
+
+```bash
+python3 --version
+```
 
 只有手动 clone、检出固定版本或从 Git 更新源仓库时才需要 Git：
 
@@ -59,7 +65,7 @@ git clone --depth 1 https://github.com/zuchengchen/goal-workflow-claude.git "$tm
 rm -rf -- "$tmp_dir"
 ```
 
-安装脚本会先校验 skill 结构，目标已存在时停止且不覆盖；更新已有安装改用 `"$tmp_dir/scripts/install-local.sh" --replace`（保留备份，见「更新」）。需要固定版本时，把 clone 命令改为 `git clone --branch v0.7.0 --depth 1 …` 再执行安装脚本。安装完成后启动新的 Claude Code 会话，确认 `/goal-workflow` 出现。
+安装脚本会先校验 skill 结构，目标已存在时停止且不覆盖；更新已有安装改用 `"$tmp_dir/scripts/install-local.sh" --replace`（保留备份，见「更新」）。需要固定版本时，把 clone 命令改为 `git clone --branch v0.8.0 --depth 1 …` 再执行安装脚本。安装完成后启动新的 Claude Code 会话，确认 `/goal-workflow` 出现。
 
 ## 方法一：从本地仓库直接复制
 
@@ -84,7 +90,7 @@ scripts/install-local.sh --dest "/path/to/target-project/.claude/skills/goal-wor
 ```bash
 install_root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
 dest="$install_root/goal-workflow"
-ref="v0.7.0"
+ref="v0.8.0"
 tmp_dir="$(mktemp -d)"
 source_dir="$tmp_dir/goal-workflow"
 
@@ -118,7 +124,7 @@ ref="0123456789abcdef0123456789abcdef01234567"
 
 ```bash
 git clone https://github.com/zuchengchen/goal-workflow-claude.git /path/to/goal-workflow-source
-git -C /path/to/goal-workflow-source checkout --detach v0.7.0
+git -C /path/to/goal-workflow-source checkout --detach v0.8.0
 ```
 
 然后用仓库自带的安全安装脚本把 canonical skill 复制到目标项目：
@@ -200,7 +206,7 @@ dest="/path/to/target-project/.claude/skills/goal-workflow"
 
 ```bash
 git -C /path/to/goal-workflow-source fetch --tags origin
-git -C /path/to/goal-workflow-source checkout --detach v0.7.0
+git -C /path/to/goal-workflow-source checkout --detach v0.8.0
 ```
 
 然后按复制步骤更新安装目录。跟随 moving ref 时可以改为：
@@ -263,6 +269,8 @@ rm -rf -- "$dest"
 ### 更新后仍看到旧行为
 
 检查是否同时存在用户级 `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/goal-workflow` 和项目级 `.claude/skills/goal-workflow`。移除或备份重复来源，并启动新会话。
+
+另需检查 skills 目录里有没有 `--replace` 留下的 `goal-workflow.backup.*`：那是完整可用的旧副本。卸载脚本默认只报告它们的路径而不删除，需要一并清掉时使用 `scripts/uninstall-local.sh --purge-backups`。
 
 `SKILL.md` frontmatter 中的 `version` 字段标识安装副本对应的发布版本（0.5.0 之前的安装没有该字段）：
 

@@ -2,6 +2,64 @@
 
 本项目的显著变更记录在此文件中，版本号遵循 Semantic Versioning。
 
+## [0.8.0]
+
+### Fixed（发布与安装）
+
+- 补打并推送缺失的 `v0.7.0` tag（指向 `bd9ecbe`）。0.7.0 发布时漏了 tag，而 INSTALL.md 六处让用户 pin `v0.7.0`，按文档执行的固定版本安装必然失败——与 0.5.0 为 v0.4.0 补 tag 是同一类事故。校验器新增 tag 存在性检查以防再犯：仅在「git 可用、仓库确实带 tag、pin 已随提交落地、且工作树干净」时报错，因此开发期的未提交版本号提升不会被拦，CI 的浅克隆（`actions/checkout` 默认不取 tag）也不会误报。
+- **破坏性缺陷**：`scripts/uninstall-local.sh` 会删掉本仓库自己的 canonical 源码 bundle。`--dest <repo>/skills/goal-workflow` 能通过全部守卫（basename 是 `goal-workflow`、父目录叫 `skills`、身份校验通过——因为它就是真的 skill），实测删除了 `skills/goal-workflow/SKILL.md` 并返回 0。现在要求卸载目标位于 Claude 配置目录内，否则拒绝并提示真实安装路径。
+- **破坏性缺陷**：`--dest ""` 静默改删默认的用户级安装并返回 0。空串被接受后又被 `-z` 回退覆盖成默认目标，使那条安全守卫成为死代码；而 INSTALL.md 文档里正是 `dest="..."` + `--dest "$dest"` 这个形状，变量未设值即误删。显式传入的空 `--dest` 现在是硬错误（退出码 2），与「未传 `--dest`」区分开。`install-local.sh` 同一处漏洞一并修复。
+- `scripts/smoke-install.sh` 此前删掉六道安全守卫仍然全绿，而它是 CI 对安装器唯一的行为防线。补齐负面断言，使每道守卫都可被证伪。
+- 卸载不再默默留下 `goal-workflow.backup.*`——那是完整可用的旧 skill 副本，会让「卸载以清除旧行为」失效。默认报告其路径，`--purge-backups` 才删除。
+- 修复备份路径遇悬空符号链接时 `[[ -e ]]` 判断为假、导致安装以未捕获的 Python 异常永久失败的问题。
+- INSTALL.md 与 README 补记 Python 3 是安装/卸载脚本的硬依赖（此前文档声称只需 Claude Code 与可选 Git，无 Python 的机器上「一句话安装」会以退出码 127 不明失败）。
+
+### Changed（行为变更）
+
+- **subagent 只读窗口收紧到 `active`**：此前只读状态列举为 `discovering`/`drafted`/`draft_approved`/`saved`，遗漏了 `start_approved`，而同一文件另一处又写「`active` 之后才可写」——两条规则在一个真实存在的窗口里给出相反答案（启动失败或冲突未解时工作流就停在 `start_approved`）。现在明确 `start_approved` 期间 subagent 仍然只读，写权限跟随 `active`。
+- **「只读」有了可判定的定义**：不改动工作树（含 `__pycache__` 等附带产物）、不改版本控制状态、不装依赖；工作树之外的临时目录允许写。因此需要产出物才能校准的验证命令，在规划期只被「写明」，在 `active` 之后才「执行」。此前「可运行不改变项目的命令」与「不得创建、修改、删除、移动任何文件」在 `pytest`、`npm install`、重定向到临时文件等场景互相矛盾，且与 `verification-integrity` 用例直接冲突。
+- **交接语统一为一句**：`Goal Directive` 成为唯一 canonical 启动句，交接路径原样复用，不再另造第二句措辞不同的「exact」文本。绝对路径永不本地化。
+- 覆盖确认在 The Two Gates 中明确为独立于两道闸门的第三个决策，始终绑定唯一绝对路径、始终单独提问。
+
+### Fixed（skill 规则的自相矛盾）
+
+- 保存失败后的状态不再二义：内容与路径未变时留在 `draft_approved`（可重试而无需重新审批），任一变更则回到 `drafted`——因此以改名解决碰撞回到 `drafted`，以覆盖确认解决则留在 `draft_approved`。
+- Resume 规则不再与碰撞规则死锁：重走保存闸门时先回读，内容逐字节一致即视为已保存，不再为自己刚写的文件索取覆盖确认。
+- 明确工作目录里的旧 goal 文件不等于「正在进行的 goal」。0.6.0 把保存位置改到当前工作目录后，该目录会堆积历史 goal 文件，而此前没有任何规则说明如何对待「本会话并未在跟随」的那些文件。
+- 启动前复查发现已有匹配 goal 时，刚保存的文件会被孤立：现在要求说明情况、给出两个绝对路径并询问保留或删除，绝不擅自删除刚写下的文件。
+- 委派限制中「不得委派保存流程」的步骤枚举补上碰撞复查与创建父目录，与 Save 段实际步骤一致。
+
+### Fixed（eval harness 可信度）
+
+- harness 不再凭空造出 gate-1 失败。`save_affirmative` 取自脚本化回复而非「闸门是否真的到达」，因此对话中途停止时会报「用户批准保存但从未写入 goal 文件」，并同时废掉那条「无可观测违规则报 harness error」的安全阀——模拟用户提早停被报成看起来很真实的 skill 失败。
+- judge 判定从「按返回内容评分」改为「按契约覆盖评分」：verdict 必须覆盖 case 声明的每一项，缺项、漏评、或凭空多出条目都算 harness error。此前空 verdict、只评 1/7 条、或杜撰不存在的 forbidden action 都会得到绿色结果。
+- 写入 goal 文件的载荷不再截断（此前 1500 字符上限会切掉 6289 字符写入的后半段，而 judge 被要求「transcript 里没有就是没发生」）；其他工具载荷上限放宽到 8000 并在截断处显式标注，使 judge 能区分「不存在」与「被省略」。
+- 单个 worker 抛异常不再丢掉整轮报告（`mkdtemp` 移入受保护区间，逃逸异常转为该 case 的 harness error）。一轮全量评测是几十分钟到约两小时的真实 token。
+- 超时改为杀整个进程组（`start_new_session=True` + SIGTERM/宽限/SIGKILL），不再留下继续消耗 token 的孤儿 `claude` 子进程；超时也不再被误判为可重试的上游抖动而立刻再起一个。
+- goal 文件识别改为大小写不敏感，并补上 `MultiEdit`：此前大写文件名对两道闸门的证据路径均不可见，`MultiEdit` 写入则完全绕过判定。
+- subagent 写入检查改为对所有 case 无条件执行，并更名 `subagent_writes_before_execution`（禁止窗口止于 start 审批，而非 save 审批）。此前 13 个 case 中仅 3 个 opt-in，把它改成无条件后整个 suite 仍全绿，说明这条本身未被测到。
+- 达到 `--max-turns` 时先算确定性证据：既死循环又在审批前写了 goal 文件，现在报 skill 失败而非 harness error。
+- 覆盖确认成为可表达的场景：预置 goal 文件发生变化，仅在 case 声明 `overwrite_consent` 且脚本用户在 `overwrite_approval` 确认时才不算违规。此前该检查无条件失败，skill 的第三个确认决策根本无法测试。
+- 收紧 gate-2 的 goal 产物豁免（此前 `tmp-goals.py`、`src/goal_tmp_helper.py`、`x2026-07-26-abc.md.bak` 等都被豁免）；`list_goal_files` 改按相对路径排除，子目录中的真实 goal 文件不再隐形；`TRANSIENT_RE` 不再匹配模型自己写的文本（`invalid JSON in model reply: ...500 records...` 曾被当作上游故障重试）。
+- 预置 goal 文件的排除改为内容敏感：仅在内容仍与播种时一致时排除，一旦被改写就算作「工作流写下的 goal 文件」。否则「批准覆盖播种路径」这一正确行为会被判成「用户批准保存但从未写入 goal 文件」——新增的 `explicit-overwrite-consent` 用例正好踩在这条上。是否允许该次写入仍由 `overwritten_fixtures` 与覆盖确认决定。
+- eval fixture 新增 `.env`（自描述的假值，不含任何形似真实凭据的内容），使「密钥只按名引用」这条不变量有可测对象。
+- `--keep-workdirs` 保留的临时目录不再残留复制进去的 `.credentials.json`。
+
+### Fixed（校验器）
+
+- 文本卫生检查此前按绝对路径 `path.parts` 匹配跳过表，导致整个 checkout 只要有 `.claude` 祖先目录就全部豁免——正好命中本项目自己使用的 `.claude/worktrees/<name>/` 布局。改按相对 root 的路径比较。
+- frontmatter 校验改为允许合法的 Claude Code skill 字段白名单（此前 `allowed-tools` 会被拒，报错信息却在说 `version`）；代码围栏检查改为正确跟踪围栏字符与长度（此前未闭合的 `~~~` 放行，而合法的四反引号嵌套三反引号被误判未闭合）。
+- `--root` 指向不存在的目录改为清晰报错，不再抛未捕获的 `FileNotFoundError`;安装 URL 的「同一仓库」检查不再因 README 里出现任何第三方 GitHub 链接而失败；CI 内容检查补上 `tests/test_harness_checks.py`，避免 CI 悄悄停止测试 harness。
+
+### Added（eval 契约）
+
+- `tests/evals.json` 升级到 schema_version 4，用例从 13 增至 16：新增 `explicit-overwrite-consent`（覆盖确认全流程）、`secret-reference-only`（密钥只按名引用，不得抄进 goal 文件）、`localized-handoff-message`（ja-JP 交接语本地化）。新增 checkpoint `overwrite_approval`、`conflict_decision`、`matching_goal_decision`，三者的脚本化回复与另两道闸门共用 y/yes/n/no 词表。
+- 补上此前完全没有断言的要求：暂存文件名必须由目标文件名派生且后缀为本次新生成、审批后的碰撞复查必须区别于早先的路径解析检查、Draft 模板的必需段落、非 ASCII 标题的音译与 60 字符 slug 上限、保存过程叙述的语言一致性。
+- `conflicting-active-goal`、`matching-active-goal`、`japanese-user-language` 此前声明零 checkpoint 回复，其终态与 forbidden action 都是 driver 提前结束对话的产物（第 2 轮就抢跑的 skill 根本等不到第 2 轮）。现在各自给出足够的脚本化回复，使违规有真实发生的机会。
+- `goal-file-collision` 此前止步于 `coverage_summary`，其标题声称保护的写入闸门根本到不了，`write_goal_file` 与 `overwrite_goal_file` 因此不可证伪；现在拒绝路径会真正走到以无碰撞名写入。
+- 并行派发与 `token_budget` 禁止推断的断言扩展到穷尽档用例（此前仅覆盖最不可能触发的两个 case）；`verification-integrity` 的断言改为「goal 中写明该防护」，与「校准在 `active` 之后才执行」一致。
+- `tests/README.md` 补记三条此前未声明的结构性限制：harness 只记录工具调用而非结果、driver 在脚本回复用尽时结束对话（因此部分终态是脚本长度的产物）、fixture 仅在会话开始前播种（保存失败与回读不一致路径无法诱发）。
+
 ## [0.7.0]
 
 ### Added
