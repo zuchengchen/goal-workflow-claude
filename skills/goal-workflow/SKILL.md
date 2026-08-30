@@ -1,7 +1,7 @@
 ---
 name: goal-workflow
 description: Turn a rough task into an approved, saved, and executable Claude Code goal through adaptive brainstorming and a one-question-at-a-time discovery interview. Use when the user invokes `/goal-workflow`, asks to define or refine a durable goal, or wants explicit scope, verification, risk, file-save approval, and execution approval before work begins.
-version: 0.6.0
+version: 0.7.0
 ---
 
 # Goal Workflow
@@ -25,21 +25,71 @@ If you are unsure whether a gate opened, it did not open.
 
 Turn rough intent into a concrete, executable goal, save the approved goal in the current working directory, obtain a second approval, and then begin executing it or hand it off.
 
-Keep this workflow self-contained. Do not invoke, trigger, or delegate to any external skill; apply the quality standard in this file directly.
+Keep this workflow self-contained. Do not invoke, trigger, or delegate to any external skill; apply the quality standard in this file directly. This restricts *skills*, not subagents: dispatching your own subagents to do work described here is expected, and is governed by Parallelism And Delegation.
 
-This is a planning workflow until the goal becomes active. Do not implement the task while brainstorming, interviewing, drafting, or waiting at an approval gate unless the user explicitly leaves this workflow and asks for implementation.
+This is a planning workflow until the goal becomes active. Do not implement the task while brainstorming, interviewing, drafting, or waiting at an approval gate unless the user explicitly leaves this workflow and asks for implementation. Neither directly nor through a subagent: work you may not do yet, you may not delegate.
 
 ## Invariants
 
 - Use the user's language for every user-visible message — including brief narration and status remarks between tool calls, not only questions, options, summaries, approval requests, and the handoff. Do not reuse a fixed-language template.
 - Ask one concise discovery question at a time. Ask two details together only when a single decision answers both; never chain independently answerable questions with "and" in one turn.
 - Inspect relevant local context before asking the user for facts that can be discovered safely.
+- Dispatch independent work in parallel, to subagents by default; see Parallelism And Delegation.
 - Do not silently expand scope or weaken verification.
 - Never copy secret values, credentials, or private tokens into the draft or saved goal file; refer to their names or retrieval mechanism instead.
 - Verification must not pass on absent, stale, incomplete, unreadable, or indeterminate evidence, or fail on a known benign collision in the target format.
 - Do not mark a goal complete without the evidence required by its saved prompt.
 
 For predefined choices, use numbered options and state that the user may answer with only the number. Recommend one option when a useful default exists. For binary approvals, state the accepted affirmative and negative replies; accept `y`/`Y` and `n`/`N` as well as clear natural-language answers.
+
+## Parallelism And Delegation
+
+Work that does not depend on other work runs in parallel, and is delegated to
+subagents by default. This applies to context inspection while planning and to
+independent subtasks and verification items while executing.
+
+Delegate and parallelize by default. Work serially only for a stated reason:
+
+- a real data dependency, where one result determines the next step;
+- shared mutation of the same file or resource;
+- an approval gate, a question to the user, or any other decision reserved to
+  the main session; or
+- work too small to be worth a subagent's setup and reporting overhead.
+
+Name the reason when you serialize something a reader would expect to be
+parallel. Do not serialize merely because parallel work is harder to narrate.
+
+### Delegation Limits
+
+These limits are what make delegation safe rather than a way around the gates.
+
+1. **Subagents are read-only until execution begins.** While `discovering`,
+   `drafted`, `draft_approved`, or `saved` — that is, until the second gate
+   opens and you start executing — a subagent may read files, search, and run
+   commands that do not mutate the project. It must not create, modify, delete,
+   or move any file, and must not run a command whose purpose is to change
+   state. The planning ban on implementing the task binds every subagent
+   exactly as it binds you. Subagents may write only once execution has begun
+   under `start_approved`, which is also what makes the goal `active`.
+2. **Only the main session touches the gates.** A subagent never shows the
+   draft, never asks for save or start approval, never interprets a reply as an
+   approval, and never writes the goal file. Both gates are opened by the user
+   answering the main session. A subagent's report is input to your decision,
+   never the decision.
+3. **Only the main session writes the goal file.** The save procedure — staging,
+   readback, rename, readback — runs in the main session, undelegated.
+4. **A subagent's claim is not evidence.** A report that a command passed proves
+   nothing on its own. Verification still follows Verification Integrity: the
+   command must actually have run, and its exit status, reports, and artifacts
+   must be observable and attributable to the current run. Treat an unverifiable
+   subagent claim as indeterminate, which means failed.
+5. **Parallel does not mean batched questions.** Parallelism is about tool work,
+   not about the interview. Keep asking the user one question at a time.
+6. **Delegation does not widen scope.** Give each subagent the narrowest task
+   and the smallest context that let it succeed, within the approved scope.
+
+Dispatch notes are user-visible narration, so they use the user's language like
+every other message.
 
 ## State Machine
 
@@ -89,7 +139,7 @@ Tell the user which depth was selected and why. The user may change it at any ti
 
 ### Brainstorm
 
-Inspect relevant files, documentation, history, and local conventions before recommending a direction.
+Inspect relevant files, documentation, history, and local conventions before recommending a direction. When several independent areas need inspecting, dispatch them concurrently to read-only subagents and recommend a direction from their combined findings.
 
 For ambiguous or design-heavy work:
 
@@ -128,6 +178,8 @@ Assign each area one status:
 - `Unresolved`: it still lacks a reliable answer. This is a valid temporary status.
 
 Do not label an uncertain area `Not applicable`. At the selected depth, repeatedly choose the highest-impact `Unresolved` area, ask one question, record the answer, and update newly revealed risks.
+
+Resolve from evidence what evidence can resolve: when several areas are waiting on local facts, send those lookups to read-only subagents in parallel and reserve the interview for decisions only the user can make. Ask one question at a time regardless of how much runs concurrently behind it.
 
 Before drafting, show a concise coverage summary grouped by status. Map every remaining `Unresolved` item to exactly one treatment:
 
@@ -233,7 +285,7 @@ If the user requests any change, revise the draft and ask again. Enter `draft_ap
 
 ### Save
 
-Only in `draft_approved`:
+Only in `draft_approved`, and only in the main session — never delegate any step below to a subagent:
 
 1. Recheck collision state after the approval and before writing. The existence check performed earlier to resolve the path does not satisfy this step: the destination may have appeared in between, so an unrepeated earlier check is the same as no check.
 2. Create the parent directory if it does not exist. The working directory normally already exists, so this is a no-op unless the user named a different directory.
@@ -270,7 +322,8 @@ Once active, treat the saved goal file as read-only and as the source of truth:
 
 - Work only within its scope and approved direction.
 - Stop on its stop conditions instead of guessing.
-- Run every required verification item and report actual results.
+- Split the work into independent subtasks and run them concurrently in subagents, serializing only where Parallelism And Delegation allows. Subagents may write once the goal is `active`, but two concurrent subagents must never be given the same file to change.
+- Run every required verification item and report actual results. Independent verification items run concurrently; a subagent's report is not evidence, so confirm exit status and artifacts as Verification Integrity requires before calling any item passed.
 - Treat skipped, zero-work, missing, stale, unreadable, truncated, or otherwise indeterminate evidence as failed verification unless the saved prompt explicitly defines it as acceptable.
 - When a check fails, distinguish product failure from verifier or environment failure. Do not change product behavior merely to appease a false positive or treat a verifier failure as success. Repair a project-owned verifier only when scope permits and the acceptance criterion remains unchanged; otherwise follow the material goal-revision rules.
 - Do not silently edit the active goal file. If the goal must change materially, stop execution, obtain explicit user direction, create a versioned successor by default, and repeat the draft, save, and start approvals as applicable.

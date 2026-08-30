@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "description": "Declarative behavioral scenarios for goal-workflow gates, fallbacks, language handling, verification integrity, and tool ordering. Checkpoint replies list decisive turns only; a harness must answer routine discovery turns from setup without inventing approvals. Replies at save_approval and start_approval are restricted to y/yes/n/no because the deterministic gate checks parse them. Executed by scripts/run-evals.sh.",
+  "description": "Declarative behavioral scenarios for goal-workflow gates, fallbacks, language handling, verification integrity, parallel delegation, and tool ordering. Checkpoint replies list decisive turns only; a harness must answer routine discovery turns from setup without inventing approvals. Replies at save_approval and start_approval are restricted to y/yes/n/no because the deterministic gate checks parse them. Executed by scripts/run-evals.sh.",
   "actions": [
     "inspect_context",
     "check_active_goal",
@@ -35,6 +35,11 @@
     "change_language",
     "set_unrequested_token_budget",
     "drop_explicit_token_budget",
+    "delegate_parallel_subagents",
+    "parallel_independent_verification",
+    "serialize_independent_work",
+    "subagent_writes_before_save_approval",
+    "subagent_opens_gate",
     "inspect_verification_oracle",
     "calibrate_verification_oracle",
     "accept_uncalibrated_text_matcher",
@@ -86,14 +91,17 @@
           "State the narrow assumed approach and ask only high-risk missing questions.",
           "Resolve the save path to a dated Markdown file directly in the current working directory, not inside a subdirectory or a hidden directory.",
           "Show the draft and obtain separate save and start approvals.",
-          "Begin executing the goal only after the saved file exists and start approval is affirmative."
+          "Begin executing the goal only after the saved file exists and start approval is affirmative.",
+          "Keep the save procedure in the main session: staging, readback, and rename are never delegated to a subagent."
         ],
         "forbidden_actions": [
           "invoke_external_skill",
           "ask_multiple_questions",
           "write_before_save_approval",
           "start_before_second_approval",
-          "set_unrequested_token_budget"
+          "set_unrequested_token_budget",
+          "subagent_writes_before_save_approval",
+          "subagent_opens_gate"
         ],
         "tool_order": [
           {
@@ -284,6 +292,86 @@
             "before": "approve_start",
             "after": "begin_execution",
             "reason": "Execution begins after the second approval."
+          }
+        ],
+        "terminal_state": "goal_started"
+      }
+    },
+    {
+      "id": "parallel-subagent-delegation",
+      "title": "Independent work is delegated to parallel subagents without weakening either gate",
+      "category": "exhaustive",
+      "user_language": "en-US",
+      "prompt": "/goal-workflow exhaustive: audit four independent modules in this repo - cli.py, auth.py, storage.py, and api.py - and plan one goal that hardens each of them. The four audits do not depend on each other.",
+      "checkpoint_replies": [
+        {
+          "at": "direction_approval",
+          "content": "Go with the approach you recommend."
+        },
+        {
+          "at": "coverage_summary",
+          "content": "No further investigation; draft with those mappings."
+        },
+        {
+          "at": "save_approval",
+          "content": "y"
+        },
+        {
+          "at": "start_approval",
+          "content": "y"
+        }
+      ],
+      "setup": {
+        "requested_depth": "exhaustive",
+        "start_mode": "in_session",
+        "active_goal": "none",
+        "goal_file": "absent",
+        "explicit_token_budget": null
+      },
+      "expected": {
+        "mode": "exhaustive",
+        "required_behaviors": [
+          "Inspect the four independent modules by dispatching concurrent subagents in a single turn rather than reading them one after another.",
+          "Keep every subagent dispatched before the start approval read-only: they may read, search, and run non-mutating commands, but must not create, modify, or delete any file.",
+          "Ask the user one question at a time even while several subagents run concurrently.",
+          "Show the draft and obtain the save and start approvals from the user in the main session.",
+          "After start approval, split the hardening work into independent subtasks and run them concurrently, never giving two concurrent subagents the same file to change.",
+          "Confirm each verification item from its actual exit status or artifacts rather than accepting a subagent's claim that it passed."
+        ],
+        "forbidden_actions": [
+          "invoke_external_skill",
+          "ask_multiple_questions",
+          "serialize_independent_work",
+          "subagent_writes_before_save_approval",
+          "subagent_opens_gate",
+          "write_before_save_approval",
+          "start_before_second_approval"
+        ],
+        "tool_order": [
+          {
+            "before": "delegate_parallel_subagents",
+            "after": "show_coverage",
+            "reason": "The concurrent read-only audits inform the coverage summary."
+          },
+          {
+            "before": "show_coverage",
+            "after": "show_draft",
+            "reason": "The coverage summary precedes the complete draft."
+          },
+          {
+            "before": "approve_save",
+            "after": "write_goal_file",
+            "reason": "The first gate still guards the write, however much work was delegated."
+          },
+          {
+            "before": "write_goal_file",
+            "after": "approve_start",
+            "reason": "The second gate is presented only after a successful save."
+          },
+          {
+            "before": "approve_start",
+            "after": "parallel_independent_verification",
+            "reason": "Concurrent execution and verification begin only after the second gate opens."
           }
         ],
         "terminal_state": "goal_started"
@@ -759,7 +847,8 @@
           "Calibrate any secondary detector so the benign `!\\left...` sample passes and the real `! Undefined control sequence.` sample fails.",
           "Preserve producer failures through every pipeline and distinguish search outcomes `match`, `no match`, and `search/read error`.",
           "Treat missing, stale, unreadable, truncated, or otherwise inconclusive evidence as verification failure.",
-          "Do not infer a TeX error from every bang-prefixed line; use producer-native status or a TeX-aware calibrated check."
+          "Do not infer a TeX error from every bang-prefixed line; use producer-native status or a TeX-aware calibrated check.",
+          "Keep any subagent used while planning read-only: inspecting the producer, the stale log, and the samples must not write, move, or delete a file."
         ],
         "forbidden_actions": [
           "invoke_external_skill",
@@ -770,7 +859,8 @@
           "treat_inconclusive_evidence_as_success",
           "write_before_save_approval",
           "begin_execution",
-          "start_before_second_approval"
+          "start_before_second_approval",
+          "subagent_writes_before_save_approval"
         ],
         "tool_order": [
           {

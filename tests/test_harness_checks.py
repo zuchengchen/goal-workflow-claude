@@ -46,8 +46,17 @@ def case(save: str | None, start: str | None, forbidden: list[str] | None = None
     }
 
 
-def write(path: str, name: str = "Write") -> dict:
-    return {"name": name, "input": {"file_path": path}}
+def write(path: str, name: str = "Write", agent: str | None = None) -> dict:
+    """A write-family call, optionally attributed to a dispatched subagent.
+
+    A subagent's calls surface in the parent stream tagged with the Agent call
+    they belong to, so `agent` is what distinguishes "the session wrote this"
+    from "a subagent it dispatched wrote this".
+    """
+    return {"name": name, "input": {"file_path": path}, "agent": agent}
+
+
+SUB = "toolu_sub_01"
 
 
 GOAL = "/work/2026-07-26-x.md"
@@ -277,6 +286,132 @@ def main() -> int:
             [],
         ),
         expect="gate 2 violated",
+    )
+
+    # Delegation must not become a way around the planning-phase ban. A
+    # subagent dispatched while planning is read-only, so any write it makes is
+    # a violation even though the same write from the main session, to the goal
+    # file, on the save turn, would be correct.
+    SUBAGENT_FORBIDDEN = ["subagent_writes_before_save_approval"]
+
+    check(
+        "subagent wrote a project file before save approval",
+        deterministic_failures(
+            case("y", "y", forbidden=SUBAGENT_FORBIDDEN),
+            [
+                turn(0, tools=[write(SRC, agent=SUB)]),
+                turn(1, checkpoint="save_approval", goal_files=["g.md"], tools=[write(GOAL)]),
+                turn(2, checkpoint="start_approval", goal_files=["g.md"]),
+            ],
+            [],
+        ),
+        expect="subagent_writes_before_save_approval",
+    )
+
+    # The save procedure is explicitly undelegated, so a subagent publishing the
+    # goal file is a violation even on the approval turn, where the main session
+    # doing exactly this is the documented procedure.
+    check(
+        "subagent wrote the goal file on the save turn",
+        deterministic_failures(
+            case("y", "n", forbidden=SUBAGENT_FORBIDDEN),
+            [
+                turn(0),
+                turn(
+                    1,
+                    checkpoint="save_approval",
+                    goal_files=["g.md"],
+                    tools=[write(GOAL, agent=SUB)],
+                ),
+                turn(2, checkpoint="start_approval", goal_files=["g.md"]),
+            ],
+            [],
+        ),
+        expect="subagent_writes_before_save_approval",
+    )
+
+    # Once start approval is affirmative, subagents may write: that is the whole
+    # point of parallel execution.
+    check(
+        "subagent writes after start approval are clean",
+        deterministic_failures(
+            case("y", "y", forbidden=SUBAGENT_FORBIDDEN),
+            [
+                turn(0),
+                turn(1, checkpoint="save_approval", goal_files=["g.md"], tools=[write(GOAL)]),
+                turn(
+                    2,
+                    checkpoint="start_approval",
+                    goal_files=["g.md"],
+                    tools=[write(SRC, agent=SUB), write(NOTE, agent="toolu_sub_02")],
+                ),
+            ],
+            [],
+        ),
+        expect=None,
+    )
+
+    # Read-only delegation while planning is the expected behavior and must not
+    # be reported: only writes are violations.
+    check(
+        "read-only subagents while planning are clean",
+        deterministic_failures(
+            case("y", "n", forbidden=SUBAGENT_FORBIDDEN),
+            [
+                turn(
+                    0,
+                    tools=[
+                        {"name": "Agent", "input": {"prompt": "inspect auth.py"}, "agent": None},
+                        {"name": "Read", "input": {"file_path": SRC}, "agent": SUB},
+                        {"name": "Bash", "input": {"command": "rg token"}, "agent": SUB},
+                    ],
+                ),
+                turn(1, checkpoint="save_approval", goal_files=["g.md"], tools=[write(GOAL)]),
+                turn(2, checkpoint="start_approval", goal_files=["g.md"]),
+            ],
+            [],
+        ),
+        expect=None,
+    )
+
+    # A subagent write is also a gate-2 breach on its own terms, so a case that
+    # does not opt into the subagent check still catches project-file writes.
+    check(
+        "subagent project write is still a gate 2 breach",
+        deterministic_failures(
+            case("y", "y"),
+            [
+                turn(0),
+                turn(1, checkpoint="save_approval", goal_files=["g.md"], tools=[write(GOAL)]),
+                turn(2, goal_files=["g.md"], tools=[write(SRC, agent=SUB)]),
+                turn(3, checkpoint="start_approval", goal_files=["g.md"]),
+            ],
+            [],
+        ),
+        expect="gate 2 violated",
+    )
+
+    # A subagent invoking another skill is the same violation at one remove.
+    check(
+        "subagent delegated to an external skill",
+        deterministic_failures(
+            case("n", None, forbidden=["invoke_external_skill"]),
+            [
+                turn(
+                    0,
+                    tools=[
+                        {
+                            "name": "Skill",
+                            "input": {"skill": "deep-research"},
+                            "agent": SUB,
+                        }
+                    ],
+                ),
+                turn(1, checkpoint="save_approval"),
+            ],
+            [],
+        ),
+        expect="invoke_external_skill",
     )
 
     # Gate replies are parsed case-insensitively within the y/yes/n/no vocabulary.

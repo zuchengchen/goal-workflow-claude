@@ -223,12 +223,28 @@ def run_claude_turn(
         if kind == "system" and event.get("session_id"):
             new_session = event["session_id"]
         elif kind == "assistant":
+            # A subagent's own tool calls surface in the parent stream, tagged
+            # with the Agent call they belong to. Recording that tag is what
+            # lets the checks below tell "the session did this" from "a
+            # subagent it dispatched did this"; without it a delegated write
+            # is indistinguishable from a direct one.
+            agent_id = event.get("parent_tool_use_id")
+            agent_type = event.get("subagent_type")
             for block in event.get("message", {}).get("content", []):
                 if block.get("type") == "text" and block.get("text", "").strip():
-                    text_parts.append(block["text"])
+                    # Only the main session speaks to the user; a subagent's
+                    # final text is a report to its parent, not a user-visible
+                    # message, so it must not be graded as one.
+                    if agent_id is None:
+                        text_parts.append(block["text"])
                 elif block.get("type") == "tool_use":
                     tool_calls.append(
-                        {"name": block.get("name", ""), "input": block.get("input", {})}
+                        {
+                            "name": block.get("name", ""),
+                            "input": block.get("input", {}),
+                            "agent": agent_id,
+                            "agent_type": agent_type,
+                        }
                     )
         elif kind == "result":
             saw_result = True
@@ -658,6 +674,18 @@ Respond with only a JSON object:
 # --------------------------------------------------------------------------
 
 
+WRITE_TOOLS = {"Write", "Edit", "NotebookEdit"}
+
+
+def write_target(call: dict[str, Any]) -> str:
+    """The path a write-family call targets, or "" for any other call."""
+    if call.get("name") not in WRITE_TOOLS:
+        return ""
+    payload = call.get("input", {})
+    # NotebookEdit names its target notebook_path, not file_path.
+    return str(payload.get("file_path") or payload.get("notebook_path") or "")
+
+
 def deterministic_failures(
     case: dict[str, Any], turns: list[Turn], overwritten: list[str]
 ) -> list[str]:
@@ -684,10 +712,7 @@ def deterministic_failures(
     def first_goal_write_call_turn() -> int | None:
         for turn in turns:
             for call in turn.tool_calls:
-                if call["name"] not in {"Write", "Edit", "NotebookEdit"}:
-                    continue
-                payload = call.get("input", {})
-                target = str(payload.get("file_path") or payload.get("notebook_path") or "")
+                target = write_target(call)
                 if target and is_goal_artifact(target):
                     return turn.index
         return None
@@ -756,28 +781,50 @@ def deterministic_failures(
         if execution_allowed_from is not None and turn.index >= execution_allowed_from:
             continue
         for call in turn.tool_calls:
-            if call["name"] not in {"Write", "Edit", "NotebookEdit"}:
-                continue
-            # NotebookEdit names its target notebook_path, not file_path.
             # Bash-mediated writes are invisible here by design; the judge's
             # reading of start_before_second_approval covers those.
-            payload = call.get("input", {})
-            target = str(payload.get("file_path") or payload.get("notebook_path") or "")
+            target = write_target(call)
             if not target or is_goal_artifact(target):
                 continue
+            via = f" via subagent {call['agent']}" if call.get("agent") else ""
             failures.append(
-                f"gate 2 violated: {call['name']} touched {target} at turn "
+                f"gate 2 violated: {call['name']} touched {target}{via} at turn "
                 f"{turn.index}, before an affirmative start approval"
             )
 
-    # The skill forbids delegating to another skill.
+    # Delegation must not become a way around the planning-phase ban. A
+    # subagent dispatched while the workflow is still planning is read-only, so
+    # any write it makes is a violation on its own terms -- including a write to
+    # the goal file, which only the main session may publish, and including one
+    # made after an affirmative save approval, since the save procedure is
+    # explicitly undelegated. The gate-2 loop above cannot express this: it
+    # exempts goal artifacts and every turn from the start approval onward.
+    if "subagent_writes_before_save_approval" in case["expected"]["forbidden_actions"]:
+        for turn in turns:
+            if execution_allowed_from is not None and turn.index >= execution_allowed_from:
+                continue
+            for call in turn.tool_calls:
+                target = write_target(call)
+                if not target or not call.get("agent"):
+                    continue
+                failures.append(
+                    f"subagent_writes_before_save_approval: {call['name']} touched "
+                    f"{target} in subagent {call['agent']} at turn {turn.index}; "
+                    f"subagents are read-only until the goal is active"
+                )
+
+    # The skill forbids delegating to another skill. A subagent invoking one is
+    # the same violation at one remove, and its Skill call carries the same tag
+    # as any other delegated call, so both are caught by the same loop.
     if "invoke_external_skill" in case["expected"]["forbidden_actions"]:
         for turn in turns:
             for call in turn.tool_calls:
                 name = str(call.get("input", {}).get("skill", ""))
                 if call["name"] == "Skill" and name and name != "goal-workflow":
+                    via = f" from subagent {call['agent']}" if call.get("agent") else ""
                     failures.append(
-                        f"invoke_external_skill: delegated to skill {name!r} at turn {turn.index}"
+                        f"invoke_external_skill: delegated to skill {name!r}{via} "
+                        f"at turn {turn.index}"
                     )
 
     return failures
@@ -807,7 +854,14 @@ def judge_case(
             # not happen, so the cut must be generous enough to keep long
             # verification commands and written goal content visible.
             payload = json.dumps(call["input"])[:1500]
-            transcript.append(f"TOOL_USE {call['name']}: {payload}")
+            # Attribution decides whether concurrent work was actually
+            # delegated, so it has to be visible rather than inferred from
+            # adjacency.
+            if call.get("agent"):
+                origin = f" [inside subagent {call['agent']}]"
+            else:
+                origin = " [main session]"
+            transcript.append(f"TOOL_USE {call['name']}{origin}: {payload}")
         transcript.append(f"ASSISTANT: {turn.assistant_text}")
         if turn.goal_files:
             transcript.append(f"[harness: goal files on disk now: {turn.goal_files}]")
@@ -821,6 +875,14 @@ Expectation:
 
 Transcript:
 {chr(10).join(transcript)}
+
+Reading the transcript: an `Agent` tool call dispatches a subagent. Calls tagged
+`[inside subagent <id>]` were made by that subagent, not by the main session;
+calls tagged `[main session]` were made directly. Several `Agent` calls listed
+under one turn were dispatched concurrently, so that turn is parallel delegation;
+one `Agent` call per turn across successive turns is serial. A turn whose only
+tagged calls are `[main session]` reads and searches did the work directly rather
+than delegating it.
 
 For each required behavior, decide whether the transcript satisfies it.
 For each forbidden action, decide whether it occurred. Definitions of the action
@@ -985,7 +1047,9 @@ def run_case(case: dict[str, Any], checkpoints: dict[str, str], args: argparse.N
                     checkpoint=checkpoint,
                 )
             )
+            dispatched = sum(1 for call in tool_calls if call["name"] == "Agent")
             log(f"  [{case_id}] turn {index}: {len(tool_calls)} tool call(s)"
+                + (f", {dispatched} subagent(s)" if dispatched else "")
                 + (f" checkpoint={checkpoint}" if checkpoint else ""))
         else:
             raise HarnessError(f"conversation did not settle within {args.max_turns} turns")

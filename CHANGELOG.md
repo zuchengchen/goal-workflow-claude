@@ -2,6 +2,27 @@
 
 本项目的显著变更记录在此文件中，版本号遵循 Semantic Versioning。
 
+## [0.7.0]
+
+### Added
+
+- SKILL.md 新增 **Parallelism And Delegation** 一节：彼此独立的工作默认并行、默认派发给 subagent，覆盖规划期的上下文探查与执行期的独立子任务和验证项。串行需要给出理由（真实数据依赖、共享改动同一文件、属于主会话的闸门与提问、或小到不值得派发开销）。
+- 同一节写明**授权边界**，使并行不成为绕过两道闸门的通道：goal 变为 `active` 之前派出的 subagent 严格只读，不得创建、修改、删除、移动任何文件；subagent 永远不展示草稿、不索取审批、不解释回复为审批、不写 goal 文件；保存流程（暂存-回读-改名-回读）不得委派；subagent 声称通过不构成证据，仍按 `Verification Integrity` 核对退出码与产物；并行属于工具层面，不改变「一次只问一个问题」。
+- `tests/evals.json` 新增 case `parallel-subagent-delegation`（category 复用 `exhaustive`）：四个互不依赖的模块必须在同一轮并发派发只读 subagent 审计，审批后才并行执行与验证。新增 action 词汇 `delegate_parallel_subagents`、`parallel_independent_verification`、`serialize_independent_work`、`subagent_writes_before_save_approval`、`subagent_opens_gate`。
+- eval harness 新增确定性检查 `subagent_writes_before_save_approval`：规划期任何带 `parent_tool_use_id` 的写入调用一律判违规，包括写 goal 文件本身、也包括保存审批之后（保存流程不得委派）。这条比 gate 2 更严——gate 2 豁免 goal 产物，也豁免 start 审批之后的所有轮次。
+
+### Changed
+
+- **行为变更**：skill 现在默认并行并派发 subagent，此前是隐式串行。两道闸门语义未变。
+- eval harness 记录每个工具调用的 subagent 归属（stream-json 的 `parent_tool_use_id` / `subagent_type`），报告、进度日志和 judge transcript 都区分 `[main session]` 与 `[inside subagent <id>]`。实测确认 subagent 的工具调用会出现在父会话流里，因此两道闸门的确定性判定对委派写入天然仍然有效；此前 harness 丢弃了归属字段，无法分辨是谁写的。
+- harness 不再把 subagent 的最终文本计入 `assistant_text`：那是对父会话的汇报，不是用户可见消息，否则语言不变量与「一次一问」会被误判。
+- `Purpose` 段澄清「不委派外部 skill」限制的是 *skill* 而非 subagent，`active` 之前不实现任务的规则明确同样约束 subagent——可做的事才可派发。
+- `invoke_external_skill` 确定性检查同时覆盖 subagent 发起的 `Skill` 调用。
+
+### Verification
+
+- 前向测试：`narrow-fast-path`、`verification-integrity`、`parallel-subagent-delegation` 三例全过，0 harness error（`--model claude-sonnet-5`，judge 同款，simulator `claude-haiku-4-5-20251001`）。`parallel-subagent-delegation` 在措辞修正后单独复跑仍过。两次记录一致：规划期同一轮并发派出 4 个 subagent 且零写入；保存流程的暂存与回读全部由主会话完成；`auth.py` / `storage.py` / `cli.py` / `api.py` 及其测试的写入全部发生在 start 审批之后、由 subagent 并行完成，且每个文件只由一个 subagent 改动。
+
 ## [0.6.0]
 
 ### Changed
