@@ -14,6 +14,19 @@
 - frontmatter 的无引号值改按 YAML 规则检查：含 `: `（YAML 会解析成映射而报错）或 ` #`（被当作注释静默截断）的值，以及以 YAML 指示符开头的值，现在都会被拒绝并提示加引号。此前 `description: Use when: …` 能通过校验，YAML 解析器却会拒绝它。
 - `.gitignore` 补上 `.claude/worktrees/`：此前 `git add -A` 会把临时 worktree 当作嵌入仓库加进来。
 
+### Fixed（eval harness）
+
+- Ctrl-C 不再被吞掉。`collect_result` 只转换 worker 自身的异常，主线程等待时收到的中断照常传播；此前中断被记成正在等待的那个 case「worker died」（它其实已经通过），运行照旧继续。SIGTERM（文档推荐的 `timeout` 包装发的就是它）与 SIGHUP 也按中断处理：取消未开始的 case，按进程组杀掉运行中的 `claude`，删除各沙箱连同凭据副本，写出带 `meta.interrupted` 的报告，退出码为 128 加信号值。此前 SIGTERM 直接杀死解释器：不写报告，运行中的沙箱都留着 `.credentials.json` 副本。
+- 报告在每个 case 结束后原子重写，并且每次运行写入各自的 `evals-report-<UTC 时间戳>.json`（`evals-report.json` 镜像最近一次）；`meta` 新增 CLI 版本、过滤条件和所请求的 case 列表。此前每次 `--case` 迭代都覆盖唯一的报告，本地那份「durable forward-test evidence」只剩 1 个 case。未知的 `--case` id 改为报错。
+- judge/simulator 的 CLI 错误结果不再被当作模型回复。此前 `ask_json` 不看 `is_error`，而上游过载的错误体本身就是 JSON 对象，被原样当作回复返回：不会重试，发生在 judge 阶段时还会在整段会话之后报成「verdict 不完整」。现在按传输层错误分类（含 `api_error_status` 与 529）并重试。
+- 已经说过话或调用过工具的回合，在 CLI 失败或超时被杀后不再重试：重试会把同一条用户回复（例如 save 闸门的 `y`）再发一次，失败那次的工具调用也会从证据里消失。现在记录这个不完整的回合并交给确定性检查，有违规则判为 skill 失败，否则为 harness error。
+- preflight 检查全部三个模型（simulator、judge、被测会话）。此前只查 simulator，`--judge-model` 写错要等每个 case 的完整会话跑完才暴露。
+- 认证与 provider 变量（`CLAUDE_CODE_OAUTH_TOKEN`、`CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY` 等）不再随外层会话变量一起被剥离，用这些方式认证的环境不再在 preflight 报「Not logged in」。
+- judge 与 simulator 以 `--tools ""` 运行，没有任何工具；此前的黑名单仍漏掉 `Workflow`、`SendMessage`、`CronCreate`、`EnterWorktree` 等。
+- subagent 派发工具同时识别 `Agent` 与 `Task`（CLI 2.1.302 的 init 事件报告为 `Task`），judge 提示同步说明。
+- 最后一条脚本回复恰好用掉最后一个允许回合时，不再被误报为「对话未在回合上限内结束」。
+- tests/README.md 不再声称 `bypassPermissions` 下的影响范围就是临时目录：它不是沙箱。
+
 ## [0.8.0]
 
 ### Fixed（发布与安装）

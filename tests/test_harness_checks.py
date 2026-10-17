@@ -13,10 +13,13 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -445,6 +448,21 @@ def check_transient_classification() -> None:
         "a transient error was not retried",
     )
 
+    # Once the operator interrupts the run, nothing is retried: a retry would
+    # start a fresh claude call while the harness is trying to stop them all.
+    run_evals.STOP.set()
+    try:
+        attempts = retry_attempts(
+            raiser(HarnessError("overloaded", transient=True)), sleepless=True
+        )
+    finally:
+        run_evals.STOP.clear()
+    expect_true(
+        "an interrupted run retries nothing",
+        attempts == 1,
+        f"a transient error was attempted {attempts} times after the interrupt",
+    )
+
 
 def raiser(error: HarnessError):
     def operation() -> None:
@@ -461,15 +479,15 @@ def retry_attempts(operation, *, sleepless: bool = False) -> int:
         calls += 1
         return operation()
 
-    original = time.sleep
+    original = run_evals.retry_pause
     if sleepless:
-        run_evals.time.sleep = lambda _seconds: None
+        run_evals.retry_pause = lambda _seconds: False
     try:
         run_evals.with_retry(counted, 3, "test")
     except HarnessError:
         pass
     finally:
-        run_evals.time.sleep = original
+        run_evals.retry_pause = original
     return calls
 
 
@@ -738,6 +756,387 @@ def check_timeout_kills_the_process_group() -> None:
             attempts == 1,
             f"the timed-out child was launched {attempts} times",
         )
+
+
+@contextmanager
+def fake_cli(stdout_lines: list[str]):
+    """Put a stand-in `claude` first on PATH that prints fixed output.
+
+    It records its argv, so a test can also check how the harness invoked it.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        argv_log = root / "argv.json"
+        script = bin_dir / "claude"
+        script.write_text(
+            "#!/usr/bin/env python3\nimport json, sys\n"
+            f"open({str(argv_log)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+            f"sys.stdout.write({chr(10).join(stdout_lines) + chr(10)!r})\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        (root / "scratch").mkdir()
+        (root / "config").mkdir()
+        saved = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{bin_dir}{os.pathsep}{saved}"
+        try:
+            yield root, argv_log
+        finally:
+            os.environ["PATH"] = saved
+
+
+def check_cli_error_results() -> None:
+    """A CLI error result is a transport failure, never a model's reply.
+
+    The judge and simulator path parsed the envelope's text without looking at
+    `is_error`, and an upstream overload body is itself a JSON object: it was
+    returned as though the model had written it, so the error was never
+    retried and surfaced as an incomplete judge verdict.
+    """
+    overload = json.dumps({
+        "type": "result",
+        "is_error": True,
+        "api_error_status": 529,
+        "result": 'API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}',
+    })
+    with fake_cli([overload]) as (root, argv_log):
+        try:
+            run_evals.ask_json("grade", None, 30, root / "scratch", root / "config")
+            outcome = "returned the API error body as a reply"
+        except HarnessError as exc:
+            outcome = "transient" if exc.transient else f"non-transient: {exc}"
+        argv = json.loads(argv_log.read_text(encoding="utf-8"))
+    expect_true(
+        "a judge/simulator API error is a retryable harness error",
+        outcome == "transient",
+        outcome,
+    )
+    tools = argv.index("--tools") if "--tools" in argv else -1
+    expect_true(
+        "graders run with no tools at all",
+        tools >= 0 and argv[tools + 1] == "" and "--disallowed-tools" not in argv,
+        f"argv was {argv}",
+    )
+
+    reply = json.dumps({"type": "result", "is_error": False, "result": '{"ok": true}'})
+    with fake_cli([reply]) as (root, _argv_log):
+        parsed = run_evals.ask_json("ping", None, 30, root / "scratch", root / "config")
+    expect_true("a normal envelope still parses", parsed == {"ok": True}, f"got {parsed!r}")
+
+    # A turn that already called a tool must not be retried: the retry would
+    # resend the user's message and drop the call from the evidence.
+    acted = [
+        json.dumps({"type": "system", "subtype": "init", "session_id": "s-1"}),
+        json.dumps({
+            "type": "assistant",
+            "parent_tool_use_id": None,
+            "message": {"content": [
+                {"type": "tool_use", "name": "Write", "input": {"file_path": "/work/cli.py"}}
+            ]},
+        }),
+        json.dumps({"type": "result", "is_error": True, "session_id": "s-1",
+                    "result": "API Error: 529 overloaded"}),
+    ]
+    with fake_cli(acted) as (root, _argv_log):
+        try:
+            run_evals.run_claude_turn(
+                "y", None, root / "scratch", root / "config", None, "bypassPermissions", 30
+            )
+            caught = None
+        except HarnessError as exc:
+            caught = exc
+    expect_true(
+        "a turn that acted before failing is recorded, not retried",
+        isinstance(caught, run_evals.InterruptedTurn)
+        and not caught.transient
+        and [call["input"]["file_path"] for call in caught.tool_calls] == ["/work/cli.py"],
+        f"got {caught!r}",
+    )
+
+    # One that failed before doing anything is a plain upstream hiccup.
+    idle = [
+        json.dumps({"type": "system", "subtype": "init", "session_id": "s-1"}),
+        json.dumps({"type": "result", "is_error": True, "session_id": "s-1",
+                    "api_error_status": 529, "result": "API Error: 529"}),
+    ]
+    with fake_cli(idle) as (root, _argv_log):
+        try:
+            run_evals.run_claude_turn(
+                "y", None, root / "scratch", root / "config", None, "bypassPermissions", 30
+            )
+            caught = None
+        except HarnessError as exc:
+            caught = exc
+    expect_true(
+        "a turn that failed before acting stays retryable",
+        caught is not None
+        and caught.transient
+        and not isinstance(caught, run_evals.InterruptedTurn),
+        f"got {caught!r}",
+    )
+
+
+def check_interrupted_turn_evidence() -> None:
+    """The partial turn's calls feed the gate checks before anything is concluded."""
+    stub_case = {
+        "id": "interrupted",
+        "title": "fails mid-turn",
+        "prompt": "do the thing",
+        "user_language": "en-US",
+        "setup": {},
+        "checkpoint_replies": [{"at": "save_approval", "content": "y"}],
+        "expected": {"forbidden_actions": []},
+    }
+
+    def turn_writing_goal(message, session_id, work, *rest):
+        raise run_evals.InterruptedTurn(
+            "claude returned an error result: API Error: 529",
+            session_id="s-1",
+            assistant_text="",
+            tool_calls=[{"name": "Write", "agent": None,
+                         "input": {"file_path": str(Path(work) / "2026-07-26-early.md")}}],
+        )
+
+    def quiet_failure(message, session_id, work, *rest):
+        raise run_evals.InterruptedTurn(
+            "claude returned an error result: API Error: 529",
+            session_id="s-1",
+            assistant_text="Let me look at the project first.",
+            tool_calls=[],
+        )
+
+    original_turn = run_evals.run_claude_turn
+    original_config = run_evals.build_config_dir
+    run_evals.build_config_dir = lambda base: base / "config"
+    try:
+        run_evals.run_claude_turn = turn_writing_goal
+        violating = run_case(stub_case, {}, run_case_args(max_turns=5))
+        run_evals.run_claude_turn = quiet_failure
+        clean = run_case(stub_case, {}, run_case_args(max_turns=5))
+    finally:
+        run_evals.run_claude_turn = original_turn
+        run_evals.build_config_dir = original_config
+
+    expect_true(
+        "a pre-approval write in a failed turn is still a gate failure",
+        violating.harness_error is None
+        and any("gate 1 violated" in f for f in violating.failures)
+        and any("turn 0 failed" in f for f in violating.failures),
+        f"harness_error={violating.harness_error!r} failures={violating.failures}",
+    )
+    expect_true(
+        "a clean failed turn is a harness error that keeps its transcript",
+        clean.harness_error is not None
+        and "partial turn" in clean.harness_error
+        and len(clean.turns) == 1
+        and clean.turns[0].assistant_text.startswith("Let me look"),
+        f"harness_error={clean.harness_error!r} turns={len(clean.turns)}",
+    )
+
+
+def check_last_turn_completion_is_judged() -> None:
+    """A script finished on the final allowed turn is complete, not unsettled."""
+    stub_case = {
+        "id": "exact-fit",
+        "title": "uses every turn",
+        "prompt": "do the thing",
+        "user_language": "en-US",
+        "setup": {},
+        "checkpoint_replies": [{"at": "coverage_summary", "content": "draft it"}],
+        "expected": {"forbidden_actions": [], "required_behaviors": [], "tool_order": [],
+                     "terminal_state": "awaiting_save_approval"},
+    }
+    originals = (run_evals.run_claude_turn, run_evals.build_config_dir,
+                 run_evals.simulate_user, run_evals.judge_case)
+    run_evals.run_claude_turn = lambda *a, **k: ("s-1", "summary shown", [])
+    run_evals.build_config_dir = lambda base: base / "config"
+    run_evals.simulate_user = lambda *a, **k: {
+        "state": "checkpoint", "checkpoint": "coverage_summary", "reply": "draft it"
+    }
+    run_evals.judge_case = lambda *a, **k: {
+        "required_behaviors": [], "forbidden_actions": [], "tool_order": [],
+        "terminal_state": {"expected": "x", "observed": "x", "matches": True, "evidence": "-"},
+    }
+    try:
+        result = run_case(stub_case, {}, run_case_args(max_turns=2))
+    finally:
+        (run_evals.run_claude_turn, run_evals.build_config_dir,
+         run_evals.simulate_user, run_evals.judge_case) = originals
+    expect_true(
+        "a scenario completed on the last allowed turn is judged",
+        result.harness_error is None and result.passed,
+        f"harness_error={result.harness_error!r} failures={result.failures}",
+    )
+
+
+def check_interrupts_are_honoured() -> None:
+    """Ctrl-C and SIGTERM stop a run, and an interrupted run still reports.
+
+    collect_result caught every BaseException, including the operator's Ctrl-C
+    arriving while it waited, so the run carried on. SIGTERM, which the
+    documented `timeout` wrapper sends, killed the interpreter outright: no
+    report, and every running sandbox kept its copy of the credentials.
+    """
+    release = threading.Event()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(release.wait, 30)
+        timer = threading.Timer(0.3, lambda: os.kill(os.getpid(), signal.SIGINT))
+        timer.start()
+        try:
+            collect_result({"id": "waiting", "title": "still running"}, future)
+            propagated = False
+        except KeyboardInterrupt:
+            propagated = True
+        finally:
+            timer.cancel()
+            release.set()
+    expect_true(
+        "Ctrl-C while waiting on a case propagates",
+        propagated,
+        "the interrupt was swallowed and reported as a dead worker",
+    )
+
+    with tempfile.TemporaryDirectory() as raw:
+        out = Path(raw) / "out"
+        sandboxes: list[Path] = []
+
+        def fake_config(base: Path) -> Path:
+            sandboxes.append(base)
+            config = base / "config"
+            config.mkdir(parents=True, exist_ok=True)
+            (config / ".credentials.json").write_text('{"fake": true}', encoding="utf-8")
+            return config
+
+        def child_until_killed(*args, **kwargs):
+            # Stands in for a claude child that runs until the interrupt kills it.
+            run_evals.STOP.wait(30)
+            raise run_evals.ProcessKilled(
+                "the session under test was stopped: the run was interrupted", stdout=""
+            )
+
+        originals = (run_evals.build_config_dir, run_evals.run_claude_turn,
+                     run_evals.preflight, run_evals.cli_version, run_evals.shutil.which)
+        run_evals.build_config_dir = fake_config
+        run_evals.run_claude_turn = child_until_killed
+        run_evals.preflight = lambda args: None
+        run_evals.cli_version = lambda: None
+        run_evals.shutil.which = lambda name: "/usr/bin/claude"
+        ids = ["narrow-fast-path", "reject-save-gate", "reject-start-gate"]
+        timer = threading.Timer(1.0, lambda: os.kill(os.getpid(), signal.SIGTERM))
+        started = time.monotonic()
+        timer.start()
+        try:
+            code = run_evals.main(
+                ["--jobs", "2", "--output", str(out)] + [arg for i in ids for arg in ("--case", i)]
+            )
+        finally:
+            timer.cancel()
+            (run_evals.build_config_dir, run_evals.run_claude_turn, run_evals.preflight,
+             run_evals.cli_version, run_evals.shutil.which) = originals
+            run_evals.STOP.clear()
+        elapsed = time.monotonic() - started
+
+        latest = out / "evals-report.json"
+        stamped = sorted(out.glob("evals-report-*.json"))
+        document = json.loads(latest.read_text(encoding="utf-8")) if latest.exists() else {}
+        cases = document.get("cases", [])
+        leftovers = [str(base) for base in sandboxes if (base / "config").exists()]
+
+    expect_true(
+        "SIGTERM stops the run promptly with exit status 143",
+        code == 143 and elapsed < 20,
+        f"exit={code} after {elapsed:.1f}s",
+    )
+    expect_true(
+        "an interrupted run writes a timestamped report accounting for every case",
+        len(stamped) == 1
+        and document.get("meta", {}).get("interrupted") == "SIGTERM"
+        and [case["id"] for case in cases] == ids
+        and all(case["harness_error"] for case in cases),
+        f"stamped={[p.name for p in stamped]} meta={document.get('meta')} "
+        f"cases={[(c['id'], c['harness_error']) for c in cases]}",
+    )
+    expect_true(
+        "no interrupted sandbox is left behind with its credentials",
+        bool(sandboxes) and not leftovers,
+        f"sandboxes={len(sandboxes)} leftovers={leftovers}",
+    )
+
+
+def check_preflight_covers_every_model() -> None:
+    """The judge is first called after a whole conversation, so check it up front."""
+    calls: list[str | None] = []
+
+    def fake_ask(prompt, model, timeout, scratch, config_dir):
+        calls.append(model)
+        if model == "missing-judge":
+            raise HarnessError("model not found")
+        return {"ok": True}
+
+    original_ask = run_evals.ask_json
+    original_config = run_evals.build_config_dir
+    run_evals.ask_json = fake_ask
+    run_evals.build_config_dir = lambda base: base / "config"
+    try:
+        run_evals.preflight(argparse.Namespace(
+            simulator_model="sim", judge_model="judge", model=None, timeout=5, retries=1
+        ))
+        checked = list(calls)
+        calls.clear()
+        try:
+            run_evals.preflight(argparse.Namespace(
+                simulator_model="sim", judge_model="missing-judge", model="sim",
+                timeout=5, retries=1,
+            ))
+            message = ""
+        except HarnessError as exc:
+            message = str(exc)
+    finally:
+        run_evals.ask_json = original_ask
+        run_evals.build_config_dir = original_config
+
+    expect_true(
+        "preflight checks the simulator, judge, and session models",
+        checked == ["sim", "judge", None],
+        f"checked {checked}",
+    )
+    expect_true(
+        "a failing judge model is named, and a shared model is checked once",
+        "judge model missing-judge" in message and calls == ["sim", "missing-judge"],
+        f"message={message!r} calls={calls}",
+    )
+
+
+def check_spawn_env_keeps_auth() -> None:
+    saved = dict(os.environ)
+    os.environ.update({
+        "CLAUDE_CODE_OAUTH_TOKEN": "token",
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "ANTHROPIC_API_KEY": "key",
+        "CLAUDE_CODE_SESSION_ID": "outer",
+        "CLAUDECODE": "1",
+        "CLAUDE_EFFORT": "max",
+    })
+    try:
+        env = run_evals.spawn_env(Path("/tmp/isolated-config"))
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    expect_true(
+        "auth and provider variables reach spawned sessions",
+        env.get("CLAUDE_CODE_OAUTH_TOKEN") == "token"
+        and env.get("CLAUDE_CODE_USE_BEDROCK") == "1"
+        and env.get("ANTHROPIC_API_KEY") == "key",
+        "an auth variable was stripped",
+    )
+    expect_true(
+        "the outer session's identity does not",
+        not {"CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_EFFORT"} & set(env)
+        and env.get("CLAUDE_CONFIG_DIR") == "/tmp/isolated-config",
+        f"leaked {sorted({'CLAUDE_CODE_SESSION_ID', 'CLAUDECODE', 'CLAUDE_EFFORT'} & set(env))}",
+    )
 
 
 def main() -> int:
@@ -1254,6 +1653,12 @@ def main() -> int:
     check_turn_limit_reports_violations()
     check_kept_workdir_drops_credentials()
     check_timeout_kills_the_process_group()
+    check_cli_error_results()
+    check_interrupted_turn_evidence()
+    check_last_turn_completion_is_judged()
+    check_interrupts_are_honoured()
+    check_preflight_covers_every_model()
+    check_spawn_env_keeps_auth()
 
     print()
     if FAILURES:

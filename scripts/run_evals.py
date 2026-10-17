@@ -35,7 +35,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -121,7 +121,40 @@ NEGATIVE_GATE_REPLIES = {"n", "no"}
 # pre-existing goal file is now load-bearing evidence, not prose for the judge.
 GATE_CHECKPOINTS = {"save_approval", "start_approval", "overwrite_approval"}
 
+# The tool that dispatches a subagent. The CLI has reported it under both names:
+# a 0.7.0 measurement saw `Agent`, while CLI 2.1.302 lists `Task` in its init
+# event. Counting only one name would read real delegation as none.
+SUBAGENT_TOOLS = {"Agent", "Task"}
+
 PRINT_LOCK = threading.Lock()
+
+# Set once the operator interrupts the run. Every claude invocation checks it
+# before starting, so a worker winding down after its child was killed cannot
+# start the simulator or the judge instead.
+STOP = threading.Event()
+# Every running claude child, so an interrupt can stop the work it is doing:
+# each child runs in its own session and never sees the terminal's Ctrl-C.
+LIVE_PROCESSES: set[subprocess.Popen[str]] = set()
+LIVE_LOCK = threading.Lock()
+
+# Auth and provider selection share the CLAUDE_CODE_ prefix with the outer
+# session's identity variables, so they are kept by name. Stripping the prefix
+# wholesale turned token, Bedrock, Vertex, and Foundry setups into "Not logged
+# in" at preflight, whose hint then suggested passing auth through the
+# environment -- the very thing being stripped.
+AUTH_ENV_KEYS = {
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    "CLAUDE_CODE_CLIENT_CERT",
+    "CLAUDE_CODE_CLIENT_KEY",
+    "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+}
 
 
 def spawn_env(config_dir: Path) -> dict[str, str]:
@@ -130,14 +163,16 @@ def spawn_env(config_dir: Path) -> dict[str, str]:
     The harness often runs from inside another Claude Code session (an agent
     or an operator shell started by one). That outer session's identity,
     effort, and IPC variables would leak into the session under test and the
-    graders, so all CLAUDE_CODE_* variables are stripped and the isolated
-    config dir is set explicitly. Auth variables such as ANTHROPIC_API_KEY
-    pass through untouched.
+    graders, so CLAUDE_CODE_* variables are stripped and the isolated config
+    dir is set explicitly. Auth travels through: ANTHROPIC_API_KEY and the like
+    are untouched, and the auth and provider variables in AUTH_ENV_KEYS are
+    kept despite their prefix.
     """
     env = {
         key: value
         for key, value in os.environ.items()
-        if key not in {"CLAUDECODE", "CLAUDE_EFFORT"} and not key.startswith("CLAUDE_CODE_")
+        if key in AUTH_ENV_KEYS
+        or (key not in {"CLAUDECODE", "CLAUDE_EFFORT"} and not key.startswith("CLAUDE_CODE_"))
     }
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
     return env
@@ -163,6 +198,49 @@ class HarnessError(RuntimeError):
         self.transient = transient
 
 
+class ProcessKilled(HarnessError):
+    """A claude child was killed -- past its deadline, or by an interrupt.
+
+    Carries what the child printed before it died, because a session under test
+    may already have called tools that the gate checks need to see.
+    """
+
+    def __init__(self, message: str, *, stdout: str) -> None:
+        super().__init__(message)
+        self.stdout = stdout
+
+
+class InterruptedTurn(HarnessError):
+    """A turn that acted -- spoke or called tools -- before the CLI failed.
+
+    Retrying it would resend the same user message into a session that already
+    holds it, so a save-approval "y" could arrive twice, and the calls the
+    failed attempt made would vanish from the trace the gate checks read. It is
+    therefore never transient: the partial turn is recorded and the case ends.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        session_id: str | None,
+        assistant_text: str,
+        tool_calls: list[dict[str, Any]],
+    ) -> None:
+        super().__init__(message)
+        self.session_id = session_id
+        self.assistant_text = assistant_text
+        self.tool_calls = tool_calls
+
+
+class RunInterrupted(Exception):
+    """Raised in the main thread when a termination signal arrives."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signal.Signals(signum).name)
+        self.signum = signum
+
+
 # Upstream capacity and rate-limit errors say nothing about the skill, so they
 # are retried rather than reported as a failing case. This pattern may only be
 # applied to transport- and CLI-level text (stderr, an is_error result payload, a
@@ -170,15 +248,32 @@ class HarnessError(RuntimeError):
 # `invalid JSON in model reply: The build returned 500 records...` retryable, and
 # any reply that mentioned something timing out with it.
 TRANSIENT_RE = re.compile(
-    r"\b(429|500|502|503|504)\b|overloaded|rate.?limit|no available accounts|"
+    r"\b(429|500|502|503|504|529)\b|overloaded|rate.?limit|no available accounts|"
     r"temporarily unavailable|connection (?:reset|closed)|mid.?response",
     re.IGNORECASE,
 )
+# The same judgement from a result event's own status field, when it has one.
+TRANSIENT_STATUSES = {408, 429, 500, 502, 503, 504, 529}
 
 
 def looks_transient(transport_detail: str) -> bool:
     """Whether transport-level failure text names a known upstream hiccup."""
     return TRANSIENT_RE.search(transport_detail) is not None
+
+
+def error_result(event: dict[str, Any]) -> HarnessError:
+    """The HarnessError for a CLI-level `is_error` result.
+
+    Its text is the CLI's, not the model's, so it may be classified.
+    """
+    detail = str(event.get("result"))[:300]
+    transient = event.get("api_error_status") in TRANSIENT_STATUSES or looks_transient(detail)
+    return HarnessError(f"claude returned an error result: {detail}", transient=transient)
+
+
+def retry_pause(seconds: float) -> bool:
+    """Wait between retries; True when the run was interrupted meanwhile."""
+    return STOP.wait(seconds)
 
 
 def with_retry(operation: Any, attempts: int, label: str) -> Any:
@@ -188,12 +283,13 @@ def with_retry(operation: Any, attempts: int, label: str) -> Any:
             return operation()
         except HarnessError as exc:
             last = exc
-            if attempt == attempts or not exc.transient:
+            if attempt == attempts or not exc.transient or STOP.is_set():
                 raise
             delay = min(30, 3 * 2 ** (attempt - 1))
             log(f"  [{label}] transient error, retrying in {delay}s ({attempt}/{attempts - 1}): "
                 f"{str(exc)[:120]}")
-            time.sleep(delay)
+            if retry_pause(delay):
+                raise
     raise last if last else HarnessError("retry loop exited unexpectedly")
 
 
@@ -216,7 +312,13 @@ def run_process(
     used to start a second `claude` beside the orphans the first one left behind,
     up to four times; and unlike a 503, a turn that ran past its deadline says
     something about the run rather than about upstream capacity.
+
+    The child is registered in LIVE_PROCESSES while it runs so that an operator
+    interrupt can stop it from the main thread, and the group is killed if the
+    waiting thread itself is interrupted.
     """
+    if STOP.is_set():
+        raise HarnessError(f"{label} was not started: the run was interrupted")
     proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
         command,
         cwd=str(cwd),
@@ -226,18 +328,39 @@ def run_process(
         text=True,
         start_new_session=True,
     )
+    with LIVE_LOCK:
+        LIVE_PROCESSES.add(proc)
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_process_group(proc)
-        # Drain the pipes so the reader threads finish and no fd is leaked; the
-        # output of a killed turn is not used.
         try:
-            proc.communicate(timeout=10)
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            pass
-        raise HarnessError(f"{label} exceeded its {timeout}s deadline and was killed") from None
+            kill_process_group(proc)
+            # Drain the pipes so the reader threads finish and no fd is leaked,
+            # keeping what the child printed before it was killed.
+            try:
+                stdout, _ = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                stdout = ""
+            raise ProcessKilled(
+                f"{label} exceeded its {timeout}s deadline and was killed", stdout=stdout or ""
+            ) from None
+        except BaseException:
+            kill_process_group(proc)
+            raise
+    finally:
+        with LIVE_LOCK:
+            LIVE_PROCESSES.discard(proc)
+    if STOP.is_set():
+        raise ProcessKilled(f"{label} was stopped: the run was interrupted", stdout=stdout or "")
     return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+
+
+def terminate_live_processes() -> None:
+    """Kill every running claude child's process group."""
+    with LIVE_LOCK:
+        procs = list(LIVE_PROCESSES)
+    for proc in procs:
+        kill_process_group(proc)
 
 
 GROUP_KILL_GRACE_SECONDS = 5.0
@@ -327,20 +450,75 @@ def run_claude_turn(
     if session_id:
         command += ["--resume", session_id]
 
-    proc = run_process(command, cwd, spawn_env(config_dir), timeout, "the session under test")
+    try:
+        proc = run_process(command, cwd, spawn_env(config_dir), timeout, "the session under test")
+    except ProcessKilled as exc:
+        stream = parse_stream(exc.stdout, session_id)
+        if stream.acted:
+            raise stream.interrupted(str(exc)) from None
+        raise
 
+    stream = parse_stream(proc.stdout, session_id)
+    if stream.result is None:
+        detail = (proc.stderr or proc.stdout or "").strip()[:400]
+        message = f"claude produced no result event (exit {proc.returncode}): {detail}"
+        if stream.acted:
+            raise stream.interrupted(message)
+        raise HarnessError(message, transient=looks_transient(detail))
+    if stream.result.get("is_error"):
+        error = error_result(stream.result)
+        if stream.acted:
+            raise stream.interrupted(str(error))
+        raise error
+    if stream.session_id is None:
+        raise HarnessError("claude did not report a session id")
+
+    return stream.session_id, stream.text, stream.tool_calls
+
+
+@dataclass
+class Stream:
+    """What one `claude -p --output-format stream-json` invocation printed."""
+
+    session_id: str | None
+    text_parts: list[str]
+    tool_calls: list[dict[str, Any]]
+    result: dict[str, Any] | None
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.text_parts).strip()
+
+    @property
+    def acted(self) -> bool:
+        """Whether the session already spoke or called a tool in this turn."""
+        return bool(self.text_parts or self.tool_calls)
+
+    def interrupted(self, message: str) -> InterruptedTurn:
+        return InterruptedTurn(
+            f"{message} (after the turn had already acted, so it was recorded "
+            f"instead of retried)",
+            session_id=self.session_id,
+            assistant_text=self.text,
+            tool_calls=self.tool_calls,
+        )
+
+
+def parse_stream(stdout: str, session_id: str | None) -> Stream:
     text_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
     new_session = session_id
-    saw_result = False
+    result: dict[str, Any] | None = None
 
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
             continue
         kind = event.get("type")
         if kind == "system" and event.get("session_id"):
@@ -370,28 +548,11 @@ def run_claude_turn(
                         }
                     )
         elif kind == "result":
-            saw_result = True
+            result = event
             if event.get("session_id"):
                 new_session = event["session_id"]
-            if event.get("is_error"):
-                # A CLI-level error result: this text is the CLI's, not the
-                # model's, so it may be read for upstream hiccups.
-                detail = str(event.get("result"))[:300]
-                raise HarnessError(
-                    f"claude returned an error result: {detail}",
-                    transient=looks_transient(detail),
-                )
 
-    if not saw_result:
-        detail = (proc.stderr or proc.stdout or "").strip()[:400]
-        raise HarnessError(
-            f"claude produced no result event (exit {proc.returncode}): {detail}",
-            transient=looks_transient(detail),
-        )
-    if new_session is None:
-        raise HarnessError("claude did not report a session id")
-
-    return new_session, "\n".join(text_parts).strip(), tool_calls
+    return Stream(new_session, text_parts, tool_calls, result)
 
 
 def ask_json(
@@ -414,8 +575,11 @@ def ask_json(
         "json",
         "--permission-mode",
         "manual",
-        "--disallowed-tools",
-        "Bash Read Write Edit Glob Grep WebFetch WebSearch Task Skill NotebookEdit TodoWrite",
+        # No tools at all. A denylist names what existed when it was written:
+        # the old one still left Workflow, SendMessage, CronCreate, and
+        # EnterWorktree to every grader. An empty --tools list cannot go stale.
+        "--tools",
+        "",
     ]
     if model:
         command += ["--model", model]
@@ -432,6 +596,14 @@ def ask_json(
             f"could not parse claude envelope: {detail}",
             transient=looks_transient(detail),
         ) from exc
+    if not isinstance(envelope, dict):
+        raise HarnessError(f"unexpected claude envelope: {str(envelope)[:300]}")
+    if envelope.get("is_error"):
+        # The CLI's own failure, such as an upstream overload. It must never
+        # reach extract_json_object: an API error body is itself a JSON object,
+        # and was handed back as though the model had written it -- unretried,
+        # and after a full conversation reported as an incomplete judge verdict.
+        raise error_result(envelope)
 
     body = envelope.get("result", "")
     if not isinstance(body, str):
@@ -1116,13 +1288,14 @@ Expectation:
 Transcript:
 {chr(10).join(transcript)}
 
-Reading the transcript: an `Agent` tool call dispatches a subagent. Calls tagged
-`[inside subagent <id>]` were made by that subagent, not by the main session;
-calls tagged `[main session]` were made directly. Several `Agent` calls listed
-under one turn were dispatched concurrently, so that turn is parallel delegation;
-one `Agent` call per turn across successive turns is serial. A turn whose only
-tagged calls are `[main session]` reads and searches did the work directly rather
-than delegating it.
+Reading the transcript: an `Agent` tool call dispatches a subagent; some CLI
+versions report the same tool as `Task`. Calls tagged `[inside subagent <id>]`
+were made by that subagent, not by the main session; calls tagged
+`[main session]` were made directly. Several dispatch calls listed under one turn
+were dispatched concurrently, so that turn is parallel delegation; one dispatch
+call per turn across successive turns is serial. A turn whose only tagged calls
+are `[main session]` reads and searches did the work directly rather than
+delegating it.
 
 For each required behavior, decide whether the transcript satisfies it.
 For each forbidden action, decide whether it occurred. Definitions of the action
@@ -1341,7 +1514,14 @@ def run_case(case: dict[str, Any], checkpoints: dict[str, str], args: argparse.N
             pending.append((seed, None))
         pending.append((case["prompt"], None))
 
+        # Why the loop stopped before the turn cap, if it did. A turn that acted
+        # and then failed ends the conversation here rather than in an
+        # exception, so the deterministic checks still read what it did.
+        ended_early = False
+        interruption: str | None = None
         for index in range(args.max_turns):
+            if STOP.is_set():
+                raise HarnessError("the run was interrupted before this case finished")
             if pending:
                 message, checkpoint = pending.pop(0)
             else:
@@ -1352,6 +1532,7 @@ def run_case(case: dict[str, Any], checkpoints: dict[str, str], args: argparse.N
                     # (e.g. waiting_on_conflict, awaiting_question). Deciding
                     # this in the driver keeps the ending deterministic instead
                     # of delegating it to the simulator model.
+                    ended_early = True
                     break
                 decision = with_retry(
                     lambda: simulate_user(
@@ -1362,6 +1543,7 @@ def run_case(case: dict[str, Any], checkpoints: dict[str, str], args: argparse.N
                     case_id,
                 )
                 if decision["state"] == "done":
+                    ended_early = True
                     break
                 if decision["state"] == "blocked":
                     # An environment fault is not a skill failure; say so plainly
@@ -1394,14 +1576,18 @@ def run_case(case: dict[str, Any], checkpoints: dict[str, str], args: argparse.N
                     reply = remaining.pop(0)["content"]
                 message = reply
 
-            session_id, text, tool_calls = with_retry(
-                lambda: run_claude_turn(
-                    message, session_id, work, config_dir, args.model,
-                    args.permission_mode, args.timeout,
-                ),
-                args.retries,
-                case_id,
-            )
+            try:
+                session_id, text, tool_calls = with_retry(
+                    lambda: run_claude_turn(
+                        message, session_id, work, config_dir, args.model,
+                        args.permission_mode, args.timeout,
+                    ),
+                    args.retries,
+                    case_id,
+                )
+            except InterruptedTurn as exc:
+                session_id, text, tool_calls = exc.session_id, exc.assistant_text, exc.tool_calls
+                interruption = str(exc)
             turns.append(
                 Turn(
                     index=index,
@@ -1412,13 +1598,19 @@ def run_case(case: dict[str, Any], checkpoints: dict[str, str], args: argparse.N
                     checkpoint=checkpoint,
                 )
             )
-            dispatched = sum(1 for call in tool_calls if call["name"] == "Agent")
+            dispatched = sum(1 for call in tool_calls if call["name"] in SUBAGENT_TOOLS)
             log(f"  [{case_id}] turn {index}: {len(tool_calls)} tool call(s)"
                 + (f", {dispatched} subagent(s)" if dispatched else "")
-                + (f" checkpoint={checkpoint}" if checkpoint else ""))
-            hit_turn_limit = False
-        else:
-            hit_turn_limit = True
+                + (f" checkpoint={checkpoint}" if checkpoint else "")
+                + (" (interrupted)" if interruption else ""))
+            if interruption is not None:
+                ended_early = True
+                break
+
+        # Running out of turns only matters when the script still had replies
+        # to send. A scenario whose final reply went out on the last allowed
+        # turn is complete, and used to be reported as one that never settled.
+        hit_turn_limit = not ended_early and bool(pending or remaining)
 
         # Run the observable checks before deciding what an unfinished
         # conversation means: a skill that skips a gate also derails the script,
@@ -1432,6 +1624,20 @@ def run_case(case: dict[str, Any], checkpoints: dict[str, str], args: argparse.N
             for name in skipped_checkpoints
         ]
         failures += deterministic_failures(case, turns, overwritten_fixtures(work, preexisting))
+
+        if interruption is not None:
+            if not failures:
+                raise HarnessError(
+                    f"turn {turns[-1].index} failed: {interruption}. The partial turn is "
+                    f"recorded in the transcript and shows no observable violation."
+                )
+            failures.append(
+                f"turn {turns[-1].index} failed: {interruption}; the violations above were "
+                f"observed before it did"
+            )
+            result.failures = failures
+            result.passed = False
+            return result
 
         if hit_turn_limit:
             if not failures:
@@ -1503,10 +1709,24 @@ def collect_result(case: dict[str, Any], future: Future[CaseResult]) -> CaseResu
     Nothing should reach this, since run_case catches Exception. It is here for
     what run_case cannot catch -- a BaseException, or a bug in its own cleanup --
     so that one broken worker costs one case rather than the whole report.
+
+    Only the worker's own exception is converted. Catching every BaseException
+    raised here also caught the operator's Ctrl-C, which arrives in this thread
+    while it waits: the interrupt was swallowed, the run went on, and the case
+    being waited on was reported as a dead worker though it had passed.
     """
+    if future.cancelled():
+        return CaseResult(
+            case_id=case["id"],
+            title=case.get("title", ""),
+            passed=False,
+            harness_error="not run: the run was interrupted before this case started",
+        )
     try:
         return future.result()
     except BaseException as exc:  # noqa: BLE001 - the report matters more
+        if not future.done() or future.exception() is not exc:
+            raise
         return CaseResult(
             case_id=case["id"],
             title=case.get("title", ""),
@@ -1516,33 +1736,106 @@ def collect_result(case: dict[str, Any], future: Future[CaseResult]) -> CaseResu
 
 
 def preflight(args: argparse.Namespace) -> None:
-    """Run one minimal model call in the isolated setup before any case.
+    """Run one minimal call per configured model in the isolated setup.
 
     A broken environment (no login, no network, an unusable CLI) fails every
     case identically and produces a report that looks like eleven skill
     problems. One cheap call against a throwaway config dir turns that into a
     single clear message before any case spends tokens.
+
+    Every distinct model is checked, not only the simulator's. The judge is
+    first called after a case's entire conversation, so a mistyped
+    --judge-model used to spend every case's tokens before the first grading
+    failed.
     """
+    roles: dict[str | None, list[str]] = {}
+    for role, model in (
+        ("simulator", args.simulator_model),
+        ("judge", args.judge_model),
+        ("session-under-test", args.model),
+    ):
+        roles.setdefault(model, []).append(role)
+
     base = Path(tempfile.mkdtemp(prefix="gw-eval-preflight-"))
     try:
         config_dir = build_config_dir(base)
         scratch = base / "scratch"
         scratch.mkdir()
-        reply = with_retry(
-            lambda: ask_json(
-                'Respond with only this JSON object: {"ok": true}',
-                args.simulator_model,
-                min(args.timeout, 120),
-                scratch,
-                config_dir,
-            ),
-            args.retries,
-            "preflight",
-        )
-        if reply.get("ok") is not True:
-            raise HarnessError(f"unexpected preflight reply: {reply!r}")
+        for model, names in roles.items():
+            label = f"the {' and '.join(names)} model {model or '(CLI default)'}"
+            try:
+                reply = with_retry(
+                    lambda: ask_json(
+                        'Respond with only this JSON object: {"ok": true}',
+                        model,
+                        min(args.timeout, 120),
+                        scratch,
+                        config_dir,
+                    ),
+                    args.retries,
+                    "preflight",
+                )
+            except HarnessError as exc:
+                raise HarnessError(f"{label}: {exc}") from exc
+            if reply.get("ok") is not True:
+                raise HarnessError(f"{label}: unexpected preflight reply: {reply!r}")
     finally:
         shutil.rmtree(base, ignore_errors=True)
+
+
+def cli_version() -> str | None:
+    """The installed CLI's version, recorded so a report can be reproduced."""
+    try:
+        completed = subprocess.run(
+            ["claude", "--version"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def report_document(meta: dict[str, Any], results: list[CaseResult]) -> dict[str, Any]:
+    return {
+        "meta": {**meta, "case_count": len(results)},
+        "cases": [
+            {
+                "id": r.case_id,
+                "title": r.title,
+                "passed": r.passed,
+                "failures": r.failures,
+                "harness_error": r.harness_error,
+                "workdir": r.workdir,
+                "turns": [
+                    {
+                        "index": t.index,
+                        "checkpoint": t.checkpoint,
+                        "user": t.user,
+                        "assistant": t.assistant_text,
+                        "tools": t.tool_calls,
+                        "goal_files": t.goal_files,
+                    }
+                    for t in r.turns
+                ],
+                "judge": r.judge,
+            }
+            for r in results
+        ],
+    }
+
+
+def write_report(paths: list[Path], meta: dict[str, Any], results: list[CaseResult]) -> None:
+    """Write the report atomically, so a reader never sees half of one."""
+    text = json.dumps(report_document(meta, results), indent=2, ensure_ascii=False) + "\n"
+    for path in paths:
+        temporary = path.with_name(f".{path.name}.tmp")
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
+
+
+def raise_run_interrupted(signum: int, _frame: Any) -> None:
+    raise RunInterrupted(signum)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1565,9 +1858,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--permission-mode",
         default="bypassPermissions",
         # A scripted session cannot answer an interactive permission prompt, so
-        # every write the skill makes has to be pre-authorised. Each case runs
-        # in its own throwaway temp directory, so the blast radius is that
-        # sandbox.
+        # every write the skill makes has to be pre-authorised. That is not a
+        # sandbox: each case starts in its own throwaway directory, but nothing
+        # confines the session to it.
         help="permission mode for the session under test (default bypassPermissions, "
         "required to let the skill write and verify without interactive prompts)",
     )
@@ -1575,7 +1868,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output",
         type=Path,
         default=REPO_ROOT / "tests" / "results",
-        help="directory for the JSON run report",
+        help="directory for the JSON run reports",
     )
     parser.add_argument("--keep-workdirs", action="store_true", help="do not delete case sandboxes")
     return parser.parse_args(argv)
@@ -1598,8 +1891,31 @@ def main(argv: list[str] | None = None) -> int:
     if not cases:
         print("ERROR: no cases matched the given filters", file=sys.stderr)
         return 2
+    unknown_ids = sorted(set(args.case) - {case["id"] for case in document["cases"]})
+    if unknown_ids:
+        print(f"ERROR: unknown case id(s): {unknown_ids}", file=sys.stderr)
+        return 2
 
-    log("Preflight: checking that the isolated environment can run a model...")
+    # A termination signal -- the documented `timeout` wrapper sends SIGTERM --
+    # used to kill the interpreter outright: no report, and every running
+    # sandbox kept its copy of the operator's credentials. It now unwinds like
+    # Ctrl-C does.
+    STOP.clear()
+    previous_handlers = {
+        signum: signal.signal(signum, raise_run_interrupted)
+        for signum in (signal.SIGTERM, signal.SIGHUP)
+    }
+    try:
+        return run_all(args, checkpoints, cases)
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
+def run_all(
+    args: argparse.Namespace, checkpoints: dict[str, str], cases: list[dict[str, Any]]
+) -> int:
+    log("Preflight: checking that the isolated environment can run every configured model...")
     try:
         preflight(args)
     except HarnessError as exc:
@@ -1607,79 +1923,92 @@ def main(argv: list[str] | None = None) -> int:
             "ERROR: preflight failed, so no case was started and no report was "
             f"written: {exc}\n"
             "The harness copies .credentials.json from the operator config dir "
-            "into an isolated CLAUDE_CONFIG_DIR; check `claude` login state or "
-            "pass auth through the environment, then rerun.",
+            "into an isolated CLAUDE_CONFIG_DIR; check `claude` login state, the "
+            "model names, or the auth variables passed through the environment, "
+            "then rerun.",
             file=sys.stderr,
         )
         return 2
+    except (KeyboardInterrupt, RunInterrupted) as exc:
+        signum = exc.signum if isinstance(exc, RunInterrupted) else signal.SIGINT
+        print("Interrupted during preflight; no case was started.", file=sys.stderr)
+        return 128 + int(signum)
 
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    log(f"Running {len(cases)} case(s) with {args.jobs} job(s).")
+    args.output.mkdir(parents=True, exist_ok=True)
+    # Every run gets its own report, so iterating on one case never overwrites
+    # the evidence of the last full run; evals-report.json mirrors the latest.
+    report = args.output / f"evals-report-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json"
+    latest = args.output / "evals-report.json"
+    meta: dict[str, Any] = {
+        # The report doubles as the forward-test evidence for the current
+        # skill, so record what was actually exercised.
+        "skill_version": (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+        "cli_version": cli_version(),
+        "model": args.model,
+        "judge_model": args.judge_model,
+        "simulator_model": args.simulator_model,
+        "filters": {"case": args.case, "category": args.category},
+        "case_ids": [case["id"] for case in cases],
+        "started_at": started_at,
+        "finished_at": None,
+        "interrupted": None,
+    }
+
+    log(f"Running {len(cases)} case(s) with {args.jobs} job(s). Report: {report}")
     if args.keep_workdirs:
         log("Case sandboxes are kept; the copied .credentials.json is removed from each.")
+
+    results: dict[str, CaseResult] = {}
+
+    def ordered() -> list[CaseResult]:
+        return [results[case["id"]] for case in cases if case["id"] in results]
+
     # A full run is tens of minutes to hours of real tokens, so no single case may
     # be able to take the report down with it. run_case already converts its own
-    # failures into a harness_error, but `pool.map` re-raises anything that got
-    # past it while the results are being iterated, which used to skip the report
-    # write entirely and discard every completed case.
-    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        futures = [
-            (case, pool.submit(run_case, case, checkpoints, args)) for case in cases
-        ]
-        results = [collect_result(case, future) for case, future in futures]
+    # failures into a harness_error, collect_result handles a worker that died
+    # anyway, and the report is rewritten after every case so even a run killed
+    # outright keeps everything that finished.
+    interrupted_by: int | None = None
+    pool = ThreadPoolExecutor(max_workers=max(1, args.jobs))
+    futures: dict[Future[CaseResult], dict[str, Any]] = {}
+    try:
+        for case in cases:
+            futures[pool.submit(run_case, case, checkpoints, args)] = case
+        outstanding = set(futures)
+        while outstanding:
+            done, outstanding = wait(outstanding, return_when=FIRST_COMPLETED)
+            for future in done:
+                case = futures[future]
+                results[case["id"]] = collect_result(case, future)
+            write_report([report, latest], meta, ordered())
+    except (KeyboardInterrupt, RunInterrupted) as exc:
+        interrupted_by = exc.signum if isinstance(exc, RunInterrupted) else int(signal.SIGINT)
+        log(f"Interrupted by {signal.Signals(interrupted_by).name}: stopping running cases...")
+        STOP.set()
+        for future in futures:
+            future.cancel()
+        terminate_live_processes()
+    finally:
+        # Workers whose children were killed finish their cleanup quickly: with
+        # STOP set they start no further claude call, and their sandboxes --
+        # credentials included -- are removed on the way out.
+        pool.shutdown(wait=True)
 
-    args.output.mkdir(parents=True, exist_ok=True)
-    report = args.output / "evals-report.json"
-    report.write_text(
-        json.dumps(
-            {
-                # The report doubles as the forward-test evidence for the
-                # current skill, so record what was actually exercised.
-                "meta": {
-                    "skill_version": (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
-                    "model": args.model,
-                    "judge_model": args.judge_model,
-                    "simulator_model": args.simulator_model,
-                    "started_at": started_at,
-                    "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "case_count": len(results),
-                },
-                "cases": [
-                    {
-                        "id": r.case_id,
-                        "title": r.title,
-                        "passed": r.passed,
-                        "failures": r.failures,
-                        "harness_error": r.harness_error,
-                        "workdir": r.workdir,
-                        "turns": [
-                            {
-                                "index": t.index,
-                                "checkpoint": t.checkpoint,
-                                "user": t.user,
-                                "assistant": t.assistant_text,
-                                "tools": t.tool_calls,
-                                "goal_files": t.goal_files,
-                            }
-                            for t in r.turns
-                        ],
-                        "judge": r.judge,
-                    }
-                    for r in results
-                ]
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    for future, case in futures.items():
+        if case["id"] not in results:
+            results[case["id"]] = collect_result(case, future)
+    meta["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if interrupted_by is not None:
+        meta["interrupted"] = signal.Signals(interrupted_by).name
+    write_report([report, latest], meta, ordered())
 
     print()
     print("=" * 72)
     failed = 0
     errored = 0
-    for r in results:
+    final = ordered()
+    for r in final:
         if r.harness_error:
             errored += 1
             status = "ERROR"
@@ -1695,9 +2024,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"        - {failure}")
     print("=" * 72)
     print(
-        f"{len(results) - failed - errored} passed, {failed} failed, "
+        f"{len(final) - failed - errored} passed, {failed} failed, "
         f"{errored} harness error(s). Report: {report}"
     )
+    if interrupted_by is not None:
+        print(f"The run was interrupted by {signal.Signals(interrupted_by).name}.")
+        return 128 + interrupted_by
     return 1 if (failed or errored) else 0
 
 
