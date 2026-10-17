@@ -161,7 +161,7 @@ grep -q '^name: goal-workflow$' .claude/skills/goal-workflow/SKILL.md
 /goal-workflow 把这个任务整理成可执行 goal
 ```
 
-仓库中的 `tests/` 和 CI 会验证 canonical skill 的结构、行为不变量和场景契约 schema；模型级前向测试仍需由人工或 agent harness 执行。开发测试不需要复制到安装目录。
+仓库中的 `tests/` 和 CI 只验证 canonical skill 的结构、安装脚本的行为和场景契约的 schema，不验证 skill 本身的行为；skill 行为由 `scripts/run-evals.sh` 对真实模型做前向测试，它会消耗 token，CI 不运行。开发测试不需要复制到安装目录。
 
 ## 同名冲突
 

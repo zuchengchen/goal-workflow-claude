@@ -37,7 +37,7 @@
 
 ### Fixed（发布与安装）
 
-- 补打并推送缺失的 `v0.7.0` tag（指向 `bd9ecbe`）。0.7.0 发布时漏了 tag，而 INSTALL.md 六处让用户 pin `v0.7.0`，按文档执行的固定版本安装必然失败——与 0.5.0 为 v0.4.0 补 tag 是同一类事故。校验器新增 tag 存在性检查以防再犯：仅在「git 可用、仓库确实带 tag、pin 已随提交落地、且工作树干净」时报错，因此开发期的未提交版本号提升不会被拦，CI 的浅克隆（`actions/checkout` 默认不取 tag）也不会误报。
+- 补打并推送缺失的 `v0.7.0` tag（指向 `bd9ecbe`）。0.7.0 发布时漏了 tag，而 INSTALL.md 六处让用户 pin `v0.7.0`，按文档执行的固定版本安装必然失败——与 0.5.0 为 v0.4.0 补 tag 是同一类事故。校验器新增 tag 存在性检查以防再犯：仅在「git 可用、仓库确实带 tag、且 pin 已随提交落地」时报错，因此开发期的未提交版本号提升不会被拦，CI 的浅克隆（`actions/checkout` 默认不取 tag）也不会误报。
 - **破坏性缺陷**：`scripts/uninstall-local.sh` 会删掉本仓库自己的 canonical 源码 bundle。`--dest <repo>/skills/goal-workflow` 能通过全部守卫（basename 是 `goal-workflow`、父目录叫 `skills`、身份校验通过——因为它就是真的 skill），实测删除了 `skills/goal-workflow/SKILL.md` 并返回 0。现在要求卸载目标位于 Claude 配置目录内，否则拒绝并提示真实安装路径。
 - **破坏性缺陷**：`--dest ""` 静默改删默认的用户级安装并返回 0。空串被接受后又被 `-z` 回退覆盖成默认目标，使那条安全守卫成为死代码；而 INSTALL.md 文档里正是 `dest="..."` + `--dest "$dest"` 这个形状，变量未设值即误删。显式传入的空 `--dest` 现在是硬错误（退出码 2），与「未传 `--dest`」区分开。`install-local.sh` 同一处漏洞一并修复。
 - `scripts/smoke-install.sh` 此前删掉六道安全守卫仍然全绿，而它是 CI 对安装器唯一的行为防线。补齐负面断言，使每道守卫都可被证伪。
@@ -80,7 +80,7 @@
 - 覆盖确认成为可表达的场景：预置 goal 文件发生变化，仅在 case 声明 `overwrite_consent` 且脚本用户在 `overwrite_approval` 确认时才不算违规。此前该检查无条件失败，skill 的第三个确认决策根本无法测试。
 - 收紧 gate-2 的 goal 产物豁免（此前 `tmp-goals.py`、`src/goal_tmp_helper.py`、`x2026-07-26-abc.md.bak` 等都被豁免）；`list_goal_files` 改按相对路径排除，子目录中的真实 goal 文件不再隐形；`TRANSIENT_RE` 不再匹配模型自己写的文本（`invalid JSON in model reply: ...500 records...` 曾被当作上游故障重试）。
 - 预置 goal 文件的排除改为内容敏感：仅在内容仍与播种时一致时排除，一旦被改写就算作「工作流写下的 goal 文件」。否则「批准覆盖播种路径」这一正确行为会被判成「用户批准保存但从未写入 goal 文件」——新增的 `explicit-overwrite-consent` 用例正好踩在这条上。是否允许该次写入仍由 `overwritten_fixtures` 与覆盖确认决定。
-- eval fixture 新增 `.env`（自描述的假值，不含任何形似真实凭据的内容），使「密钥只按名引用」这条不变量有可测对象。
+- eval fixture 新增 `.env`，使「密钥只按名引用」这条不变量有可测对象。其中的值是不属于任何真实系统的随机十六进制串，且刻意不标注为假值，理由见上文「评测驱动的收紧」。
 - `--keep-workdirs` 保留的临时目录不再残留复制进去的 `.credentials.json`。
 
 ### Fixed（校验器）
@@ -98,6 +98,12 @@
 - 并行派发与 `token_budget` 禁止推断的断言扩展到穷尽档用例（此前仅覆盖最不可能触发的两个 case）；`verification-integrity` 的断言改为「goal 中写明该防护」，与「校准在 `active` 之后才执行」一致。
 - `tests/README.md` 补记三条此前未声明的结构性限制：harness 只记录工具调用而非结果、driver 在脚本回复用尽时结束对话（因此部分终态是脚本长度的产物）、fixture 仅在会话开始前播种（保存失败与回读不一致路径无法诱发）。
 
+### Verification
+
+- 结构检查全绿：`./scripts/validate.sh`、`python3 tests/test_harness_checks.py`（18 → 61 项）、`./scripts/smoke-install.sh`、`git diff --check`。安装器与卸载器的 21 道安全守卫全部经变异测试证明可被证伪（逐一删除后 smoke 必失败）。
+- 前向测试（`--model claude-sonnet-5`，judge 同款，simulator `claude-haiku-4-5-20251001`）：`secret-reference-only`、`verification-integrity`、`goal-file-collision`、`explicit-overwrite-consent`、`localized-handoff-message` 全过，0 harness error。其中三项是先失败、按实测证据修正后复跑通过；另外独立于 judge 核对过：没有任何一次写入调用包含字面密钥值。
+- 两处破坏性安装器缺陷各自复现过一次再验证修复：`--dest <repo>/skills/goal-workflow` 此前删除 canonical bundle 并返回 0，`--dest ""` 此前误删用户级安装并返回 0。
+
 ## [0.7.0]
 
 ### Added
@@ -114,12 +120,6 @@
 - harness 不再把 subagent 的最终文本计入 `assistant_text`：那是对父会话的汇报，不是用户可见消息，否则语言不变量与「一次一问」会被误判。
 - `Purpose` 段澄清「不委派外部 skill」限制的是 *skill* 而非 subagent，`active` 之前不实现任务的规则明确同样约束 subagent——可做的事才可派发。
 - `invoke_external_skill` 确定性检查同时覆盖 subagent 发起的 `Skill` 调用。
-
-### Verification (0.8.0)
-
-- 结构检查全绿：`./scripts/validate.sh`、`python3 tests/test_harness_checks.py`（18 → 61 项）、`./scripts/smoke-install.sh`、`git diff --check`。安装器与卸载器的 21 道安全守卫全部经变异测试证明可被证伪（逐一删除后 smoke 必失败）。
-- 前向测试（`--model claude-sonnet-5`，judge 同款，simulator `claude-haiku-4-5-20251001`）：`secret-reference-only`、`verification-integrity`、`goal-file-collision`、`explicit-overwrite-consent`、`localized-handoff-message` 全过，0 harness error。其中三项是先失败、按实测证据修正后复跑通过；另外独立于 judge 核对过：没有任何一次写入调用包含字面密钥值。
-- 两处破坏性安装器缺陷各自复现过一次再验证修复：`--dest <repo>/skills/goal-workflow` 此前删除 canonical bundle 并返回 0，`--dest ""` 此前误删用户级安装并返回 0。
 
 ### Verification
 
