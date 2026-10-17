@@ -2,6 +2,12 @@
 
 本项目的显著变更记录在此文件中，版本号遵循 Semantic Versioning。
 
+## [Unreleased]
+
+### Fixed（安装与更新）
+
+- `--replace` 的备份不再放在 `skills/` 里。Claude Code 会把 `skills/` 下任何含 `SKILL.md` 的目录都加载为 skill（CLI 2.1.302 实测：`goal-workflow.backup.*` 和隐藏的 `.goal-workflow.backup.*` 都会出现在 skill 列表与 `/` 命令里），所以按文档更新后，最多 3 份旧版本与新版本同时生效——这正是排错一节「更新后仍看到旧行为」的成因。备份改放在 `skills/` 旁的 `goal-workflow-backups/`；安装与卸载脚本会把旧版本留在 `skills/` 内的备份移过去（只移动、不删除），`--purge-backups` 一并清除。备份位置若是符号链接或非目录则拒绝执行，避免备份经由符号链接落回 `skills/`。INSTALL.md 的手动备份示例同步改为移出 `skills/`。
+
 ## [0.8.0]
 
 ### Fixed（发布与安装）

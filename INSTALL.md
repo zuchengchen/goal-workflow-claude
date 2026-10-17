@@ -175,15 +175,17 @@ find "$dest" -maxdepth 2 -type f -print
 git -C "$dest" remote -v 2>/dev/null || true
 ```
 
-需要保留时先重命名备份：
+需要保留时先把它移出 `skills/` 目录备份。Claude Code 会把 `skills/` 下任何含 `SKILL.md` 的目录都加载为 skill，改名或隐藏的副本也不例外，所以备份留在 `skills/` 里会与新版本同时生效：
 
 ```bash
-dest="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/goal-workflow"
-backup="${dest}.backup.$(date +%Y%m%d%H%M%S)"
-mv "$dest" "$backup"
+config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+dest="$config_dir/skills/goal-workflow"
+backup_dir="$config_dir/goal-workflow-backups"
+mkdir -p "$backup_dir"
+mv "$dest" "$backup_dir/goal-workflow.manual.$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
-然后重新安装并验证。确认新版本工作正常后，再由你决定是否删除备份。项目级 `.claude/skills/goal-workflow` 采用同样策略。若用户级和项目级同时存在同名 skill，优先保留单一、明确的来源，避免不同版本随启动目录变化。
+然后重新安装并验证。确认新版本工作正常后，再由你决定是否删除备份；`goal-workflow.manual.*` 不会被安装脚本的保留策略或 `--purge-backups` 自动删除。项目级 `.claude/skills/goal-workflow` 采用同样策略，备份目录相应改为 `.claude/goal-workflow-backups`。若用户级和项目级同时存在同名 skill，优先保留单一、明确的来源，避免不同版本随启动目录变化。
 
 ## 更新
 
@@ -194,7 +196,7 @@ dest="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/goal-workflow"
 /path/to/goal-workflow-source/scripts/install-local.sh --dest "$dest" --replace
 ```
 
-脚本会打印保留的备份路径。验证通过后重启 Claude Code，再由你决定是否删除备份。项目级安装同理，只需把 `dest` 改为：
+脚本会打印保留的备份路径。备份放在 `skills/` 旁边的 `goal-workflow-backups/` 目录（用户级即 `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/goal-workflow-backups/`），默认只保留最近 3 份；它们不在 `skills/` 里，因此不会被 Claude Code 当作 skill 加载。0.9.0 之前的版本把备份放在 `skills/` 内，会让旧版本与新版本同时生效；0.9.0 起，安装和卸载脚本会把这些旧备份移到新位置。验证通过后重启 Claude Code，再由你决定是否删除备份。项目级安装同理，只需把 `dest` 改为：
 
 ```bash
 dest="/path/to/target-project/.claude/skills/goal-workflow"
@@ -270,7 +272,7 @@ rm -rf -- "$dest"
 
 检查是否同时存在用户级 `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/goal-workflow` 和项目级 `.claude/skills/goal-workflow`。移除或备份重复来源，并启动新会话。
 
-另需检查 skills 目录里有没有 `--replace` 留下的 `goal-workflow.backup.*`：那是完整可用的旧副本。卸载脚本默认只报告它们的路径而不删除，需要一并清掉时使用 `scripts/uninstall-local.sh --purge-backups`。
+另需检查 skills 目录里有没有 `goal-workflow.backup.*` 或其他含 `SKILL.md` 的副本：0.9.0 之前的 `--replace` 把备份留在那里，每一份都会作为完整可用的旧版本被加载。用 0.9.0 及以后的脚本重新安装或卸载，会把它们移到 `goal-workflow-backups/`；需要一并删除时使用 `scripts/uninstall-local.sh --purge-backups`。
 
 `SKILL.md` frontmatter 中的 `version` 字段标识安装副本对应的发布版本（0.5.0 之前的安装没有该字段）：
 

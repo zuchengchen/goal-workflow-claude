@@ -17,6 +17,22 @@ trap 'exit 130' HUP INT TERM
 
 export CLAUDE_CONFIG_DIR="$TMP_ROOT/claude-config"
 DEST="$CLAUDE_CONFIG_DIR/skills/goal-workflow"
+BACKUP_DIR="$CLAUDE_CONFIG_DIR/goal-workflow-backups"
+
+# Claude Code loads every directory under skills/ that holds a SKILL.md, so a
+# backup there is a live second copy of the skill. Fails if any is present.
+assert_no_backup_in_skills() {
+  local skills_dir=$1 context=$2
+  local stray=()
+  shopt -s nullglob
+  stray=("$skills_dir"/goal-workflow.backup.* "$skills_dir"/.goal-workflow.backup.*)
+  shopt -u nullglob
+  if ((${#stray[@]} != 0)); then
+    printf 'ERROR: %s left %d backup(s) inside the skills directory, where they load as skills\n' \
+      "$context" "${#stray[@]}" >&2
+    exit 1
+  fi
+}
 
 "$INSTALLER" >/dev/null
 test -f "$DEST/SKILL.md"
@@ -173,12 +189,13 @@ test ! -e "$DEST/local-update-marker"
 python3 "$VALIDATOR" --skill-dir "$DEST" --installed-only >/dev/null
 
 shopt -s nullglob
-backups=("$CLAUDE_CONFIG_DIR/skills"/goal-workflow.backup.*)
+backups=("$BACKUP_DIR"/goal-workflow.backup.*)
 shopt -u nullglob
 if [[ ${#backups[@]} -ne 1 || ! -f "${backups[0]}/local-update-marker" ]]; then
-  printf 'ERROR: --replace did not retain the previous installation as a backup\n' >&2
+  printf 'ERROR: --replace did not retain the previous installation as a backup in %s\n' "$BACKUP_DIR" >&2
   exit 1
 fi
+assert_no_backup_in_skills "$CLAUDE_CONFIG_DIR/skills" "--replace"
 
 # A sibling copy under a different name is a valid skill in a valid skills
 # directory, so only the basename check stands between it and deletion.
@@ -306,7 +323,7 @@ for _ in 1 2 3 4 5; do
   "$INSTALLER" --replace >/dev/null
 done
 shopt -s nullglob
-retained=("$CLAUDE_CONFIG_DIR/skills"/goal-workflow.backup.*)
+retained=("$BACKUP_DIR"/goal-workflow.backup.*)
 shopt -u nullglob
 if ((${#retained[@]} > 3)); then
   printf 'ERROR: repeated --replace accumulated %d backups without pruning\n' "${#retained[@]}" >&2
@@ -320,13 +337,69 @@ fi
 "$UNINSTALLER" --purge-backups >/dev/null
 test ! -e "$DEST"
 shopt -s nullglob
-leftover=("$CLAUDE_CONFIG_DIR/skills"/goal-workflow.backup.*)
+leftover=("$BACKUP_DIR"/goal-workflow.backup.*)
 shopt -u nullglob
 if ((${#leftover[@]} != 0)); then
   printf 'ERROR: --purge-backups left %d backups behind\n' "${#leftover[@]}" >&2
   exit 1
 fi
+test ! -e "$BACKUP_DIR"
 "$INSTALLER" >/dev/null
+"$UNINSTALLER" >/dev/null
+test ! -e "$DEST"
+
+# Versions before 0.9.0 kept backups inside skills/, where they still load as
+# skills. Installing moves them out rather than deleting them.
+LEGACY_NAME="goal-workflow.backup.20260101T000000Z.4242"
+cp -R "$CANONICAL" "$CLAUDE_CONFIG_DIR/skills/$LEGACY_NAME"
+install_output="$("$INSTALLER")"
+assert_no_backup_in_skills "$CLAUDE_CONFIG_DIR/skills" "install"
+test -f "$BACKUP_DIR/$LEGACY_NAME/SKILL.md"
+if ! printf '%s\n' "$install_output" | grep -qF "Moved legacy backup $CLAUDE_CONFIG_DIR/skills/$LEGACY_NAME"; then
+  printf 'ERROR: install did not report moving a legacy backup out of the skills directory\n' >&2
+  exit 1
+fi
+
+# Uninstalling must not leave a legacy backup loaded as the skill it removes.
+# A dry run reports the move without making it.
+cp -R "$CANONICAL" "$CLAUDE_CONFIG_DIR/skills/$LEGACY_NAME"
+dry_output="$("$UNINSTALLER" --dry-run)"
+test -d "$CLAUDE_CONFIG_DIR/skills/$LEGACY_NAME"
+if ! printf '%s\n' "$dry_output" | grep -qF "Would move legacy backup $CLAUDE_CONFIG_DIR/skills/$LEGACY_NAME"; then
+  printf 'ERROR: uninstall --dry-run did not report the legacy backup it would move\n' >&2
+  exit 1
+fi
+uninstall_output="$("$UNINSTALLER")"
+test ! -e "$DEST"
+assert_no_backup_in_skills "$CLAUDE_CONFIG_DIR/skills" "uninstall"
+test -f "$BACKUP_DIR/$LEGACY_NAME.1/SKILL.md"
+if ! printf '%s\n' "$uninstall_output" | grep -qF "Found backup $BACKUP_DIR/$LEGACY_NAME.1"; then
+  printf 'ERROR: uninstall did not report the legacy backup it moved\n' >&2
+  exit 1
+fi
+
+# --purge-backups clears legacy and current backups alike, then the empty
+# backup directory.
+"$INSTALLER" >/dev/null
+cp -R "$CANONICAL" "$CLAUDE_CONFIG_DIR/skills/$LEGACY_NAME"
+"$UNINSTALLER" --purge-backups >/dev/null
+test ! -e "$DEST"
+assert_no_backup_in_skills "$CLAUDE_CONFIG_DIR/skills" "uninstall --purge-backups"
+test ! -e "$BACKUP_DIR"
+
+# A backup location that is a symlink is refused before the installed skill is
+# touched: one pointing back into skills/ would make every backup a live skill
+# again, which is the defect the separate directory exists to prevent.
+"$INSTALLER" >/dev/null
+ln -s "$CLAUDE_CONFIG_DIR/skills" "$BACKUP_DIR"
+symlinked_backup_error="$("$INSTALLER" --replace 2>&1 >/dev/null || true)"
+if ! printf '%s\n' "$symlinked_backup_error" | grep -q '^ERROR: backup location is not a plain directory'; then
+  printf 'ERROR: --replace did not refuse a symlinked backup location\n' >&2
+  exit 1
+fi
+test -f "$DEST/SKILL.md"
+assert_no_backup_in_skills "$CLAUDE_CONFIG_DIR/skills" "--replace with a symlinked backup location"
+rm -f "$BACKUP_DIR"
 "$UNINSTALLER" >/dev/null
 test ! -e "$DEST"
 
@@ -375,6 +448,7 @@ test -d "$INVALID_DEST"
 # the symlink on exactly the path the installer is about to choose: it runs as a
 # child of the installer, so $PPID is the PID the installer interpolates.
 DANGLING_ROOT="$TMP_ROOT/dangling/.claude/skills"
+DANGLING_BACKUPS="$TMP_ROOT/dangling/.claude/goal-workflow-backups"
 DANGLING_DEST="$DANGLING_ROOT/goal-workflow"
 "$INSTALLER" --dest "$DANGLING_DEST" >/dev/null
 
@@ -386,18 +460,18 @@ REAL_DATE="$(command -v date)"
   printf 'stamp="$(%q "$@")"\n' "$REAL_DATE"
   printf 'if [[ "${1-}" == "-u" ]]; then\n'
   printf '  ln -s %q "%s/goal-workflow.backup.$stamp.$PPID"\n' \
-    "$TMP_ROOT/dangling-missing-target" "$DANGLING_ROOT"
+    "$TMP_ROOT/dangling-missing-target" "$DANGLING_BACKUPS"
   printf 'fi\n'
   printf '%s\n' 'printf "%s\n" "$stamp"'
 } >"$SHIM_BIN/date"
 chmod +x "$SHIM_BIN/date"
 
 if ! PATH="$SHIM_BIN:$PATH" "$INSTALLER" --dest "$DANGLING_DEST" --replace >/dev/null 2>&1; then
-  printf 'ERROR: --replace failed with a dangling backup symlink in the skills directory\n' >&2
+  printf 'ERROR: --replace failed with a dangling backup symlink in the backup directory\n' >&2
   exit 1
 fi
 shopt -s nullglob
-dangling_links=("$DANGLING_ROOT"/goal-workflow.backup.*)
+dangling_links=("$DANGLING_BACKUPS"/goal-workflow.backup.*)
 shopt -u nullglob
 dangling_seen=0
 for entry in ${dangling_links[@]+"${dangling_links[@]}"}; do

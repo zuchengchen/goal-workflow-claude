@@ -100,7 +100,8 @@ usage() {
     "" \
     "The destination must be a goal-workflow directory directly inside a skills" \
     "directory of a Claude configuration directory, never a source checkout." \
-    "--replace keeps the $BACKUP_RETENTION most recent backups and prunes older ones."
+    "--replace keeps the $BACKUP_RETENTION most recent backups in goal-workflow-backups/" \
+    "beside the skills directory and prunes older ones."
 }
 
 DEST=""
@@ -214,6 +215,49 @@ if [[ -e "$DEST" && $REPLACE -eq 1 ]]; then
   fi
 fi
 
+# Backups live beside the skills directory, never inside it. Claude Code loads
+# every directory under skills/ that holds a SKILL.md, whatever its name --
+# goal-workflow.backup.<stamp> and a hidden .goal-workflow.backup.<stamp> alike
+# (measured with CLI 2.1.302) -- so a backup kept there stays a live second copy
+# of the skill, and an update left the old behavior running beside the new.
+BACKUP_DIR="$DEST_ROOT/goal-workflow-backups"
+if [[ -L "$BACKUP_DIR" || ( -e "$BACKUP_DIR" && ! -d "$BACKUP_DIR" ) ]]; then
+  printf 'ERROR: backup location is not a plain directory: %s\n' "$BACKUP_DIR" >&2
+  exit 1
+fi
+
+# Before 0.9.0 backups were kept inside skills/, where they are still loaded.
+# Moving them out keeps every copy while ending the duplicate skill; a failed
+# move is reported but does not undo an install that already succeeded.
+migrate_legacy_backups() {
+  local legacy target suffix
+  local legacy_entries=()
+  shopt -s nullglob
+  legacy_entries=("$DEST_PARENT"/goal-workflow.backup.*)
+  shopt -u nullglob
+  for legacy in ${legacy_entries[@]+"${legacy_entries[@]}"}; do
+    if [[ -L "$legacy" || ! -d "$legacy" ]]; then
+      printf 'Kept unexpected non-directory legacy backup entry %s\n' "$legacy"
+      continue
+    fi
+    if ! mkdir -p "$BACKUP_DIR"; then
+      printf 'WARNING: could not create %s; legacy backups remain in the skills directory\n' "$BACKUP_DIR" >&2
+      return 0
+    fi
+    target="$BACKUP_DIR/$(basename "$legacy")"
+    suffix=0
+    while [[ -e "$target" || -L "$target" ]]; do
+      suffix=$((suffix + 1))
+      target="$BACKUP_DIR/$(basename "$legacy").$suffix"
+    done
+    if rename_path "$legacy" "$target"; then
+      printf 'Moved legacy backup %s out of the skills directory to %s\n' "$legacy" "$target"
+    else
+      printf 'WARNING: could not move legacy backup %s out of the skills directory; it is still loaded as a skill\n' "$legacy" >&2
+    fi
+  done
+}
+
 STAGE_ROOT=""
 BACKUP_PATH=""
 OLD_MOVED=0
@@ -245,12 +289,13 @@ cp -R "$SOURCE_DIR/." "$STAGED_SKILL/"
 python3 "$VALIDATOR" --skill-dir "$STAGED_SKILL" --installed-only >/dev/null
 
 if [[ -e "$DEST" ]]; then
+  mkdir -p "$BACKUP_DIR"
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  BACKUP_PATH="$DEST_PARENT/goal-workflow.backup.$timestamp.$$"
+  BACKUP_PATH="$BACKUP_DIR/goal-workflow.backup.$timestamp.$$"
   suffix=0
   while [[ -e "$BACKUP_PATH" || -L "$BACKUP_PATH" ]]; do
     suffix=$((suffix + 1))
-    BACKUP_PATH="$DEST_PARENT/goal-workflow.backup.$timestamp.$$.${suffix}"
+    BACKUP_PATH="$BACKUP_DIR/goal-workflow.backup.$timestamp.$$.${suffix}"
   done
   rename_path "$DEST" "$BACKUP_PATH"
   OLD_MOVED=1
@@ -264,11 +309,13 @@ if [[ -n "$BACKUP_PATH" ]]; then
   printf 'Previous installation retained at %s\n' "$BACKUP_PATH"
 fi
 
-# Every --replace leaves a full copy of the previous installation behind, and a
-# stale copy still looks installed. Keep the newest BACKUP_RETENTION and prune
-# the rest, reporting each removal so nothing disappears silently.
+migrate_legacy_backups
+
+# Every --replace leaves a full copy of the previous installation behind. Keep
+# the newest BACKUP_RETENTION and prune the rest, reporting each removal so
+# nothing disappears silently.
 shopt -s nullglob
-BACKUPS=("$DEST_PARENT"/goal-workflow.backup.*)
+BACKUPS=("$BACKUP_DIR"/goal-workflow.backup.*)
 shopt -u nullglob
 if ((${#BACKUPS[@]} > BACKUP_RETENTION)); then
   # The timestamp is fixed-width, so a lexical sort is chronological and the

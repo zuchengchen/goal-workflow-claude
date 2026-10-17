@@ -91,12 +91,15 @@ usage() {
     "Options:" \
     "  --dest PATH       Destination (default: \${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/skills/goal-workflow)" \
     "  --dry-run         Validate and print the target without deleting it" \
-    "  --purge-backups   Also remove goal-workflow.backup.* siblings left by --replace" \
+    "  --purge-backups   Also remove the backups that install-local.sh --replace kept" \
     "  -h, --help        Show this help" \
     "" \
     "The target must be a goal-workflow directory directly inside a skills" \
     "directory of a Claude configuration directory, never a source checkout." \
-    "Backups are reported but retained unless --purge-backups is given."
+    "Backups in goal-workflow-backups/ beside the skills directory are reported" \
+    "but retained unless --purge-backups is given. Backups that older versions" \
+    "left inside the skills directory are moved there, since Claude Code would" \
+    "otherwise keep loading them as a skill."
 }
 
 DEST=""
@@ -196,10 +199,18 @@ fi
 
 python3 "$VALIDATOR" --skill-dir "$DEST" --identity-only >/dev/null
 
-# A backup left by install-local.sh --replace is a complete working skill copy,
-# so uninstalling without addressing it leaves the old behavior live.
+# install-local.sh --replace keeps backups in goal-workflow-backups/ beside the
+# skills directory, where Claude Code does not load them. Before 0.9.0 it kept
+# them inside skills/, where every one is still a live copy of the skill:
+# uninstalling around them would leave the old behavior running. Those are
+# moved out by default and removed with the rest under --purge-backups.
+BACKUP_DIR="$DEST_ROOT/goal-workflow-backups"
 shopt -s nullglob
-BACKUPS=("$DEST_PARENT"/goal-workflow.backup.*)
+BACKUPS=()
+if [[ -d "$BACKUP_DIR" && ! -L "$BACKUP_DIR" ]]; then
+  BACKUPS=("$BACKUP_DIR"/goal-workflow.backup.*)
+fi
+LEGACY_BACKUPS=("$DEST_PARENT"/goal-workflow.backup.*)
 shopt -u nullglob
 
 report_backups() {
@@ -215,6 +226,13 @@ report_backups() {
 
 if [[ $DRY_RUN -eq 1 ]]; then
   printf 'Would uninstall validated goal-workflow at %s\n' "$DEST"
+  for backup in ${LEGACY_BACKUPS[@]+"${LEGACY_BACKUPS[@]}"}; do
+    if [[ $PURGE_BACKUPS -eq 1 ]]; then
+      printf 'Would remove legacy backup %s\n' "$backup"
+    else
+      printf 'Would move legacy backup %s out of the skills directory to %s\n' "$backup" "$BACKUP_DIR"
+    fi
+  done
   if [[ $PURGE_BACKUPS -eq 1 ]]; then
     report_backups "Would remove"
   else
@@ -238,19 +256,49 @@ if ! rm -rf "$QUARANTINE"; then
 fi
 printf 'Uninstalled goal-workflow from %s\n' "$DEST"
 
+remove_backup() {
+  local backup=$1
+  if [[ -L "$backup" || ! -d "$backup" ]]; then
+    printf 'Kept unexpected non-directory backup entry %s\n' "$backup"
+    return 0
+  fi
+  if rm -rf "$backup"; then
+    printf 'Removed backup %s\n' "$backup"
+  else
+    printf 'ERROR: could not remove backup %s\n' "$backup" >&2
+    exit 1
+  fi
+}
+
 if [[ $PURGE_BACKUPS -eq 1 ]]; then
-  for backup in ${BACKUPS[@]+"${BACKUPS[@]}"}; do
-    if [[ -L "$backup" || ! -d "$backup" ]]; then
-      printf 'Kept unexpected non-directory backup entry %s\n' "$backup"
+  for backup in ${LEGACY_BACKUPS[@]+"${LEGACY_BACKUPS[@]}"} ${BACKUPS[@]+"${BACKUPS[@]}"}; do
+    remove_backup "$backup"
+  done
+  # Only an empty directory is removed: anything else in it is not ours.
+  if [[ -d "$BACKUP_DIR" && ! -L "$BACKUP_DIR" ]]; then
+    rmdir "$BACKUP_DIR" 2>/dev/null || true
+  fi
+else
+  for legacy in ${LEGACY_BACKUPS[@]+"${LEGACY_BACKUPS[@]}"}; do
+    if [[ -L "$legacy" || ! -d "$legacy" ]]; then
+      printf 'Kept unexpected non-directory legacy backup entry %s\n' "$legacy"
       continue
     fi
-    if rm -rf "$backup"; then
-      printf 'Removed backup %s\n' "$backup"
-    else
-      printf 'ERROR: could not remove backup %s\n' "$backup" >&2
+    if [[ -L "$BACKUP_DIR" || ( -e "$BACKUP_DIR" && ! -d "$BACKUP_DIR" ) ]]; then
+      printf 'ERROR: backup location is not a plain directory, so legacy backup %s stays loaded as a skill: %s\n' \
+        "$legacy" "$BACKUP_DIR" >&2
       exit 1
     fi
+    mkdir -p "$BACKUP_DIR"
+    target="$BACKUP_DIR/$(basename "$legacy")"
+    suffix=0
+    while [[ -e "$target" || -L "$target" ]]; do
+      suffix=$((suffix + 1))
+      target="$BACKUP_DIR/$(basename "$legacy").$suffix"
+    done
+    rename_path "$legacy" "$target"
+    printf 'Moved legacy backup %s out of the skills directory to %s\n' "$legacy" "$target"
+    BACKUPS+=("$target")
   done
-else
   report_backups "Found"
 fi
