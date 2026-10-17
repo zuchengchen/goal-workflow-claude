@@ -27,6 +27,12 @@
 - 最后一条脚本回复恰好用掉最后一个允许回合时，不再被误报为「对话未在回合上限内结束」。
 - tests/README.md 不再声称 `bypassPermissions` 下的影响范围就是临时目录：它不是沙箱。
 
+### Changed（eval 契约，schema_version 5）
+
+- `expected.mode` 纳入 judge 评判。此前每个 case 都声明访谈深度，却没有任何检查读取它：`ambiguous-design-choice` 与 `japanese-user-language` 是安全类任务，按 SKILL.md 的 Depth 规则应选 exhaustive（历史实测也确实选了 exhaustive），契约却写着 standard，照样「通过」。现在两者改为 exhaustive；`matching-active-goal` 停在已有 goal 的选择处、从不选深度，改为 `null`；8 个并非测试深度选择的 case 在 prompt 中显式写明 `standard:`（`conflicting-active-goal` 的 setup 同步改为 standard），期望值不再取决于主观判断。judge 必须给出 mode 判定，漏判、或在期望为 null 时擅自判定，都按 harness error 处理。
+- `reserve_path` 的顺序约束与 SKILL.md 对齐。SKILL.md 规定在 discovering 阶段解析保存路径，并把「goal 文件位置」列为覆盖项，所以路径会出现在覆盖摘要里；而 `narrow-fast-path`、`reject-save-gate` 要求路径解析在覆盖摘要之后，`exhaustive-discovery` 要求在用户选择开始起草之后，历史 judge 只能以「路径是覆盖摘要的最后一行」勉强判过。三处改为约束覆盖摘要（或开始起草的决定）先于完整草稿。
+- `verification-integrity` 的 prompt 提到的旧失败日志此前在 fixture 里并不存在。fixture 新增 `docs/appendix.log`：来自旧版 appendix.tex 的一次失败构建，修改时间早于运行，使「不得复用陈旧产物」有真实对象可测。
+
 ## [0.8.0]
 
 ### Fixed（发布与安装）

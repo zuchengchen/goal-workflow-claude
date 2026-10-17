@@ -362,6 +362,43 @@ def check_judge_verdict_coverage() -> None:
     judge_outcome("verdict without terminal_state is a harness error", no_terminal,
                   expect_harness=True)
 
+    # The interview depth was declared by every case and graded by nothing. A
+    # declared mode is now part of what the verdict has to answer.
+    mode_case = {"expected": {**JUDGE_CASE["expected"], "mode": "exhaustive"}}
+
+    def with_mode(observed: str, matches: bool) -> dict:
+        verdict = complete_verdict()
+        verdict["mode"] = {"expected": "exhaustive", "observed": observed,
+                           "matches": matches, "evidence": "turn 0"}
+        return verdict
+
+    for label, verdict, expected_failure in (
+        ("a matching interview depth passes", with_mode("exhaustive", True), None),
+        ("a different interview depth fails the case", with_mode("standard", False),
+         "interview depth mismatch"),
+    ):
+        try:
+            failures = judge_failures(mode_case, verdict)
+            ok = (not failures) if expected_failure is None else any(
+                expected_failure in item for item in failures
+            )
+            detail = f"got {failures}"
+        except HarnessError as exc:
+            ok, detail = False, f"unexpected harness error: {exc}"
+        expect_true(label, ok, detail)
+
+    for label, case_under_test, verdict in (
+        ("a declared mode left ungraded is a harness error", mode_case, complete_verdict()),
+        ("a mode graded where none is declared is a harness error", JUDGE_CASE,
+         with_mode("exhaustive", True)),
+    ):
+        try:
+            judge_failures(case_under_test, verdict)
+            ok, detail = False, "graded cleanly"
+        except HarnessError:
+            ok, detail = True, ""
+        expect_true(label, ok, detail)
+
     # An empty expectation must still be answered explicitly, and a verdict that
     # answers it is complete.
     empty_case = {"expected": {"terminal_state": "awaiting_save_approval"}}

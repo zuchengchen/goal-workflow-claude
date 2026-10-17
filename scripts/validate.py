@@ -65,7 +65,7 @@ KNOWN_FRONTMATTER_KEYS = {
 }
 REQUIRED_FRONTMATTER_KEYS = {"name", "description"}
 
-EVAL_SCHEMA_VERSION = 4
+EVAL_SCHEMA_VERSION = 5
 
 REQUIRED_EVAL_CATEGORIES = {
     "narrow",
@@ -508,9 +508,11 @@ def validate_eval_case(
         checks.errors.append(f"{label}.expected must be an object")
         return category if isinstance(category, str) else None
     require_exact_keys(expected, expected_keys, f"{label}.expected", checks)
+    # null marks a case that ends before any interview depth is chosen, such as
+    # one that stops at the matching-goal choice; the judge grades every other.
     checks.require(
-        expected.get("mode") in {"fast", "standard", "exhaustive"},
-        f"{label}.expected.mode is invalid",
+        expected.get("mode") in {"fast", "standard", "exhaustive", None},
+        f"{label}.expected.mode must be fast, standard, exhaustive, or null",
     )
     validate_string_list(
         expected.get("required_behaviors"), f"{label}.expected.required_behaviors", checks
