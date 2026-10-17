@@ -8,6 +8,12 @@
 
 - `--replace` 的备份不再放在 `skills/` 里。Claude Code 会把 `skills/` 下任何含 `SKILL.md` 的目录都加载为 skill（CLI 2.1.302 实测：`goal-workflow.backup.*` 和隐藏的 `.goal-workflow.backup.*` 都会出现在 skill 列表与 `/` 命令里），所以按文档更新后，最多 3 份旧版本与新版本同时生效——这正是排错一节「更新后仍看到旧行为」的成因。备份改放在 `skills/` 旁的 `goal-workflow-backups/`；安装与卸载脚本会把旧版本留在 `skills/` 内的备份移过去（只移动、不删除），`--purge-backups` 一并清除。备份位置若是符号链接或非目录则拒绝执行，避免备份经由符号链接落回 `skills/`。INSTALL.md 的手动备份示例同步改为移出 `skills/`。
 
+### Fixed（校验器）
+
+- 本地校验不再因被 git 忽略的文件失败。卫生检查与「仓库根不得有 goal 文件」检查改为只看 git 会纳入提交的文件（已跟踪的文件加未被忽略的未跟踪文件），正好是 CI 的 `git diff --check` 能看到的范围；没有 git 时退回目录遍历。此前在本仓库用一次 skill，它按设计写到仓库根、并已被 `.gitignore` 忽略的 goal 文件就会让 `validate.sh` 失败。
+- frontmatter 的无引号值改按 YAML 规则检查：含 `: `（YAML 会解析成映射而报错）或 ` #`（被当作注释静默截断）的值，以及以 YAML 指示符开头的值，现在都会被拒绝并提示加引号。此前 `description: Use when: …` 能通过校验，YAML 解析器却会拒绝它。
+- `.gitignore` 补上 `.claude/worktrees/`：此前 `git add -A` 会把临时 worktree 当作嵌入仓库加进来。
+
 ## [0.8.0]
 
 ### Fixed（发布与安装）

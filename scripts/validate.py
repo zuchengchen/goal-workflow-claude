@@ -122,6 +122,11 @@ class Checks:
         return None
 
 
+# Characters that cannot begin a plain (unquoted) YAML scalar. `-`, `?` and `:`
+# are indicators only when followed by whitespace, so they are checked apart.
+YAML_PLAIN_FORBIDDEN_START = set("[]{},#&*!|>%@`")
+
+
 def decode_yaml_scalar(raw: str, path: Path, checks: Checks) -> str | None:
     value = raw.strip()
     if not value:
@@ -142,6 +147,25 @@ def decode_yaml_scalar(raw: str, path: Path, checks: Checks) -> str | None:
             checks.errors.append(f"invalid single-quoted scalar in {path}: {value}")
             return None
         return value[1:-1].replace("''", "'")
+    # A plain scalar is read by the line parser above as everything after the
+    # key, but a YAML parser is stricter: `description: Use when: x` is a
+    # syntax error, and ` #` starts a comment that silently truncates the
+    # value. Either would pass here and then fail, or misread, when Claude Code
+    # parses the frontmatter, so both are rejected with a pointer to quoting.
+    if ": " in value or value.endswith(":") or " #" in value or "\t#" in value:
+        checks.errors.append(
+            f"plain YAML scalar in {path} contains ': ' or ' #', which a YAML "
+            f"parser reads as a mapping or a comment; quote it: {value!r}"
+        )
+        return None
+    if value[0] in YAML_PLAIN_FORBIDDEN_START or (
+        value[0] in "-?:" and (len(value) == 1 or value[1] in " \t")
+    ):
+        checks.errors.append(
+            f"plain YAML scalar in {path} starts with the YAML indicator "
+            f"{value[0]!r}; quote it: {value!r}"
+        )
+        return None
     return value
 
 
@@ -236,11 +260,10 @@ def scan_fences(body: str) -> tuple[list[bool], tuple[int, str] | None]:
     """Track fenced-code-block state the way a Markdown renderer does.
 
     Counting fence lines and testing the total for evenness is wrong in both
-    directions, and this document relies on the difference. A `~~~` fence was
-    not counted at all, so an unterminated one passed; and a longer fence
-    wrapping a shorter one -- exactly how SKILL.md embeds the goal template as
-    a ```md block inside a ````md block -- counted three markers and was
-    rejected as unterminated.
+    directions. A `~~~` fence was not counted at all, so an unterminated one
+    passed; and a longer fence wrapping a shorter one -- the standard way to
+    show a fenced block inside another, such as a ```md block inside a ````md
+    block -- counted three markers and was rejected as unterminated.
 
     So the state is tracked properly: an opener records its character and run
     length, and only a run of the same character, at least as long as the
@@ -629,35 +652,54 @@ def validate_evals(path: Path, checks: Checks) -> None:
     )
 
 
-def validate_text_hygiene(root: Path, checks: Checks) -> None:
-    text_suffixes = {".json", ".md", ".py", ".sh", ".yaml", ".yml"}
-    text_names = {".gitignore", "LICENSE", "VERSION"}
-    # tests/results holds generated eval reports: ignored by git, so not subject
-    # to the hygiene rules that mirror `git diff --check`.
-    #
-    # The skip list is matched against the path *relative to the root*. Matching
-    # absolute path components exempted the entire checkout whenever any
-    # ancestor directory happened to be named one of these, which is exactly the
-    # `.claude/worktrees/<name>/` layout this project's own tooling creates: the
-    # hygiene checks silently stopped running inside a worktree.
-    #
-    # `.claude` is not skipped wholesale. It once held only session-local
-    # settings, but `.claude/plans/` is tracked now, and CI's `git diff --check`
-    # inspects every tracked file -- skipping the directory would let a tracked
-    # file fail CI while passing here, which is exactly the superset property
-    # these checks exist to hold.
-    skip_parts = {".git", "__pycache__", "worktrees"}
-    # Git-ignored, so CI never reads it: a local permission allowlist whose
-    # formatting is Claude Code's business, not this repository's.
+def committable_files(root: Path) -> list[Path] | None:
+    """Tracked files plus untracked ones git would commit, or None if git cannot tell.
+
+    That is exactly the set CI's `git diff --check` can ever see. Ignored files
+    -- the skill's own dated goal files, eval reports, caches, the session-local
+    settings file, transient worktrees -- never reach CI, and holding them to
+    its rules failed local validation on files the repository deliberately
+    keeps out: using the skill once in this checkout was enough.
+    """
+    listing = git_output(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    if listing is None:
+        return None
+    return [root / name for name in listing.split("\0") if name]
+
+
+def walked_files(root: Path) -> list[Path]:
+    """Every file under root minus known ignored areas, for a tree without git.
+
+    Matched against the path *relative to the root*. Matching absolute path
+    components exempted the entire checkout whenever any ancestor directory
+    happened to share a skipped name, which is exactly the
+    `.claude/worktrees/<name>/` layout this project's own tooling creates.
+    `.claude` itself is not skipped: `.claude/plans/` is tracked.
+    """
+    skip_parts = {".git", "__pycache__"}
+    skip_dirs = {Path(".claude/worktrees"), Path("tests/results")}
     skip_files = {Path(".claude/settings.local.json")}
-    results_dir = root / "tests" / "results"
+    files = []
     for path in root.rglob("*"):
         relative = path.relative_to(root)
         if skip_parts & set(relative.parts) or relative in skip_files:
             continue
-        if not path.is_file() or path.is_symlink():
+        if any(skipped in relative.parents for skipped in skip_dirs):
             continue
-        if results_dir in path.parents:
+        files.append(path)
+    return files
+
+
+def validate_text_hygiene(root: Path, checks: Checks) -> None:
+    text_suffixes = {".json", ".md", ".py", ".sh", ".yaml", ".yml"}
+    text_names = {".gitignore", "LICENSE", "VERSION"}
+    # Git decides what can reach CI whenever it is available; the walk is only
+    # the fallback for an extracted tarball or another tree without git.
+    files = committable_files(root)
+    if files is None:
+        files = walked_files(root)
+    for path in files:
+        if not path.is_file() or path.is_symlink():
             continue
         if path.suffix not in text_suffixes and path.name not in text_names:
             continue
@@ -903,14 +945,23 @@ def validate_repository(root: Path, checks: Checks) -> None:
         f"{sorted(forbidden_bundle_entries)}",
     )
 
-    root_goal_files = [
+    # The skill saves goal files into the working directory, so one at the root
+    # of this checkout is expected and git-ignored. Only a goal file git would
+    # commit is a problem.
+    candidates = committable_files(root)
+    if candidates is None:
+        candidates = list(root.iterdir())
+    root_goal_files = sorted(
         path.name
-        for path in root.iterdir()
-        if path.is_file() and re.fullmatch(r"20\d{2}-\d{2}-\d{2}-.+\.md", path.name)
-    ]
+        for path in candidates
+        if path.parent == root
+        and path.is_file()
+        and re.fullmatch(r"20\d{2}-\d{2}-\d{2}-.+\.md", path.name)
+    )
     checks.require(
         not root_goal_files,
-        f"historical goal files must not live at repository root: {sorted(root_goal_files)}",
+        f"goal files at the repository root must stay git-ignored, not committed: "
+        f"{root_goal_files}",
     )
     validate_evals(root / "tests" / "evals.json", checks)
     checks.require((root / "tests" / "README.md").is_file(), "missing tests/README.md")
