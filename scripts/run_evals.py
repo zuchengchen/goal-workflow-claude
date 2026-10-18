@@ -1812,7 +1812,8 @@ def preflight(args: argparse.Namespace) -> None:
         scratch = base / "scratch"
         scratch.mkdir()
         for model, names in roles.items():
-            label = f"the {' and '.join(names)} model {model or '(CLI default)'}"
+            roles_text = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+            label = f"the {roles_text} model {model or '(CLI default)'}"
             try:
                 reply = with_retry(
                     lambda: ask_json(
