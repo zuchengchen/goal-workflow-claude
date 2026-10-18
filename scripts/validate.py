@@ -80,6 +80,7 @@ REQUIRED_EVAL_CATEGORIES = {
     "non_chinese",
     "token_budget",
     "verification_integrity",
+    "native_goal",
 }
 
 # The harness's deterministic gate checks parse the scripted replies at these
@@ -90,6 +91,10 @@ REQUIRED_EVAL_CATEGORIES = {
 # free-form "sure, go ahead" would be scored as a refusal.
 GATE_CHECKPOINTS = {"save_approval", "start_approval", "overwrite_approval"}
 GATE_REPLIES = {"y", "yes", "n", "no"}
+# The start gate has one more affirmative: the user typing `/goal` with the
+# saved Goal Condition. The harness composes that command from the saved file,
+# so the case only names it.
+NATIVE_GOAL_REPLY = "/goal"
 
 SEMVER = (
     r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
@@ -443,10 +448,12 @@ def validate_eval_case(
                 used_checkpoints.add(at)
             content = reply.get("content")
             if at in GATE_CHECKPOINTS and isinstance(content, str):
+                allowed = GATE_REPLIES | ({NATIVE_GOAL_REPLY} if at == "start_approval" else set())
                 checks.require(
-                    content.strip().lower() in GATE_REPLIES,
+                    content.strip().lower() in allowed,
                     f"{reply_label}.content at {at!r} must be one of y/yes/n/no "
-                    f"(case-insensitive) so the deterministic gate checks can read it",
+                    + ("or /goal " if at == "start_approval" else "")
+                    + "(case-insensitive) so the deterministic gate checks can read it",
                 )
 
     setup = case.get("setup")

@@ -116,6 +116,11 @@ def is_goal_artifact(target: str) -> bool:
 # checks misread as a refusal.
 AFFIRMATIVE_GATE_REPLIES = {"y", "yes"}
 NEGATIVE_GATE_REPLIES = {"n", "no"}
+# A scripted start_approval reply of `/goal` stands for the user typing Claude
+# Code's native goal command with the saved file's Goal Condition, which the
+# skill accepts as a start approval. It is composed from the saved file at the
+# moment it is sent, since the condition quotes a path chosen during the run.
+NATIVE_GOAL_REPLY = "/goal"
 # Every checkpoint whose reply a deterministic check reads as yes or no. The
 # overwrite decision joins the two gates here because consent to replace a
 # pre-existing goal file is now load-bearing evidence, not prose for the judge.
@@ -1081,7 +1086,32 @@ def gate_reply(case: dict[str, Any], checkpoint: str) -> str | None:
 
 
 def is_affirmative(reply: str | None) -> bool:
-    return reply is not None and reply.strip().lower() in AFFIRMATIVE_GATE_REPLIES
+    return reply is not None and reply.strip().lower() in AFFIRMATIVE_GATE_REPLIES | {
+        NATIVE_GOAL_REPLY
+    }
+
+
+def saved_goal_condition(work: Path, preexisting: dict[str, str]) -> str | None:
+    """The Goal Condition sentence of the goal file this run saved, if any.
+
+    Returns the newest saved goal file's `## Goal Condition` section as one
+    line, which is how a user would type it after `/goal`.
+    """
+    best: tuple[float, str] | None = None
+    for relative in list_goal_files(work, preexisting):
+        path = work / relative
+        try:
+            text = path.read_text(encoding="utf-8")
+            modified = path.stat().st_mtime
+        except OSError:
+            continue
+        match = re.search(r"^## Goal Condition[ \t]*\n(.*?)(?=^#{1,3} |\Z)", text, re.M | re.S)
+        if match is None:
+            continue
+        condition = " ".join(match.group(1).split())
+        if condition and (best is None or modified > best[0]):
+            best = (modified, condition)
+    return best[1] if best else None
 
 
 def deterministic_failures(
@@ -1537,14 +1567,14 @@ def run_case(case: dict[str, Any], checkpoints: dict[str, str], args: argparse.N
         base = Path(tempfile.mkdtemp(prefix=f"gw-eval-{case_id}-"))
         result.workdir = str(base)
         for reply in case["checkpoint_replies"]:
-            if reply["at"] in GATE_CHECKPOINTS and (
-                reply["content"].strip().lower()
-                not in AFFIRMATIVE_GATE_REPLIES | NEGATIVE_GATE_REPLIES
-            ):
+            allowed = AFFIRMATIVE_GATE_REPLIES | NEGATIVE_GATE_REPLIES
+            if reply["at"] == "start_approval":
+                allowed = allowed | {NATIVE_GOAL_REPLY}
+            if reply["at"] in GATE_CHECKPOINTS and reply["content"].strip().lower() not in allowed:
                 raise HarnessError(
                     f"scripted gate reply {reply['content']!r} at {reply['at']!r} is "
-                    f"outside the y/yes/n/no vocabulary the deterministic gate checks "
-                    f"parse; fix the case, not the skill"
+                    f"outside the y/yes/n/no (or /goal at start_approval) vocabulary the "
+                    f"deterministic gate checks parse; fix the case, not the skill"
                 )
         config_dir = build_config_dir(base)
         work, preexisting = prepare_workdir(base, case)
@@ -1569,6 +1599,7 @@ def run_case(case: dict[str, Any], checkpoints: dict[str, str], args: argparse.N
         # exception, so the deterministic checks still read what it did.
         ended_early = False
         interruption: str | None = None
+        script_failures: list[str] = []
         for index in range(args.max_turns):
             if STOP.is_set():
                 raise HarnessError("the run was interrupted before this case finished")
@@ -1624,6 +1655,18 @@ def run_case(case: dict[str, Any], checkpoints: dict[str, str], args: argparse.N
                         del remaining[:position]
                     checkpoint = name
                     reply = remaining.pop(0)["content"]
+                    if name == "start_approval" and reply.strip().lower() == NATIVE_GOAL_REPLY:
+                        condition = saved_goal_condition(work, preexisting)
+                        if condition is None:
+                            # The user cannot type a condition the saved file
+                            # does not carry: that is the skill's omission.
+                            script_failures.append(
+                                "the case answers the start gate with /goal, but no saved "
+                                "goal file carries a Goal Condition section to type after it"
+                            )
+                            ended_early = True
+                            break
+                        reply = f"{NATIVE_GOAL_REPLY} {condition}"
                 message = reply
 
             try:
@@ -1674,6 +1717,13 @@ def run_case(case: dict[str, Any], checkpoints: dict[str, str], args: argparse.N
             for name in skipped_checkpoints
         ]
         failures += deterministic_failures(case, turns, overwritten_fixtures(work, preexisting))
+
+        if script_failures:
+            # The scripted conversation could not go on, so a judge verdict on
+            # the truncated transcript would be noise.
+            result.failures = failures + script_failures
+            result.passed = False
+            return result
 
         if interruption is not None:
             if not failures:

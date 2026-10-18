@@ -2,7 +2,19 @@
 
 本项目的显著变更记录在此文件中，版本号遵循 Semantic Versioning。
 
-## [Unreleased]
+## [0.9.0]
+
+### Changed（行为变更：接入 Claude Code 原生 `/goal`）
+
+- goal 文件模板新增 `## Goal Condition`：一句可以直接跟在 `/goal` 后面的声明式条件，写明 goal 文件的绝对路径，成立条件是「所有必需验证项已通过并报告，或执行已在某个停止条件处停下并询问用户」。第二个分句不可省：CLI 2.1.302 的 `/goal` 是一个会话级 Stop hook，没有这一句，hook 会把执行推过停止条件，逼会话去猜。
+- 第二道闸门在当前会话执行的路径上同时提供 `/goal <Goal Condition>`：用户输入它就是开始执行的明确批准，并让 Claude Code 在条件成立前持续工作；普通的肯定答复仍然有效。启动前的复查把这个原生 goal 视为本 goal 自己的约束，而不是「已有的匹配 goal」。
+- 交接改为给出 `/goal <Goal Condition>`，并附 `Goal Directive` 作为 `/goal` 不可用时（未信任的工作区、禁用了 hooks）的备用启动语；两者都原样取自已保存的文件。
+- 「标记完成 / 受阻」改为在对话中报告并附证据；原生 goal 生效期间，暂停或放弃需要用户输入 `/goal clear`。skill 明确说明自己无法设置、清除或满足原生 goal。
+- `token_budget` 仍会记录并在开始执行时声明，但同时说明没有任何机制强制执行它（`/goal` 也不计量 token）；执行时优先选更省的等价方案，剩余工作显然超出预算时停下来询问。
+
+### Added（eval 契约）
+
+- 新类别 `native_goal` 与用例 `native-goal-start`。start 闸门的脚本回复可以写作 `/goal`，harness 从已保存的文件读出 Goal Condition，组装成 `/goal <条件>` 发送；已保存的文件缺少这一段时判为 skill 失败。两个交接用例改为要求 `/goal` 交接语加 Directive 备用；模板必需段落清单加入 Goal Condition；token 预算用例要求同时声明预算不被强制执行。
 
 ### Fixed（安装与更新）
 
@@ -32,6 +44,12 @@
 - `expected.mode` 纳入 judge 评判。此前每个 case 都声明访谈深度，却没有任何检查读取它：`ambiguous-design-choice` 与 `japanese-user-language` 是安全类任务，按 SKILL.md 的 Depth 规则应选 exhaustive（历史实测也确实选了 exhaustive），契约却写着 standard，照样「通过」。现在两者改为 exhaustive；`matching-active-goal` 停在已有 goal 的选择处、从不选深度，改为 `null`；8 个并非测试深度选择的 case 在 prompt 中显式写明 `standard:`（`conflicting-active-goal` 的 setup 同步改为 standard），期望值不再取决于主观判断。judge 必须给出 mode 判定，漏判、或在期望为 null 时擅自判定，都按 harness error 处理。
 - `reserve_path` 的顺序约束与 SKILL.md 对齐。SKILL.md 规定在 discovering 阶段解析保存路径，并把「goal 文件位置」列为覆盖项，所以路径会出现在覆盖摘要里；而 `narrow-fast-path`、`reject-save-gate` 要求路径解析在覆盖摘要之后，`exhaustive-discovery` 要求在用户选择开始起草之后，历史 judge 只能以「路径是覆盖摘要的最后一行」勉强判过。三处改为约束覆盖摘要（或开始起草的决定）先于完整草稿。
 - `verification-integrity` 的 prompt 提到的旧失败日志此前在 fixture 里并不存在。fixture 新增 `docs/appendix.log`：来自旧版 appendix.tex 的一次失败构建，修改时间早于运行，使「不得复用陈旧产物」有真实对象可测。
+
+### Verification
+
+- 结构检查全绿：`./scripts/validate.sh`、`python3 tests/test_harness_checks.py`（61 → 86 项）、`./scripts/smoke-install.sh`、`git diff --check`。新增的 5 道安装器守卫和 8 处 harness 修复都经变异测试证明可被证伪（逐一改坏后对应测试必失败）。备份移出 `skills/` 后不再被加载，用 CLI 2.1.302 的 init 事件核对过。
+- **本版本没有做前向测试**，与 CLAUDE.md「SKILL.md 的改动必须用 `./scripts/run-evals.sh` 前向测试」的规定不符，是维护者明确决定的例外。原因：本机通过 API 中转站访问 Claude，中转站对所有无头 `claude -p` 调用都返回 403（`devin upstream error (permission_denied)`，有时措辞为余额不足），与模型、配置、工具集都无关；以往证据所用的 simulator 模型 `claude-haiku-4-5-20251001` 也已不可用。每次尝试都在 preflight 被拦下，没有一个 case 开始。
+- 因此以下几点没有在真实模型上验证过：SKILL.md 的原生 `/goal` 接入（第二道闸门接受 `/goal`、`Goal Condition` 段、交接语）与 `token_budget` 措辞的实际行为；原生 `/goal` 在 `-p` 下可用（依据是阅读 CLI 2.1.302 自带的实现）；schema 5 的 mode 评判与顺序约束调整；subagent 派发在 `tool_use` 中的实际名称是 `Agent` 还是 `Task`。能运行无头调用后，应当先跑全量 17 例再依赖这些改动：`timeout 10800 ./scripts/run-evals.sh --model claude-sonnet-5-5 --simulator-model claude-haiku-5-5 --judge-model claude-sonnet-5-5 --jobs 3 --max-turns 40 --keep-workdirs`。
 
 ## [0.8.0]
 

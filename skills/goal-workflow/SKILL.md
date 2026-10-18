@@ -1,7 +1,7 @@
 ---
 name: goal-workflow
 description: Turn a rough task into an approved, saved, and executable Claude Code goal through adaptive brainstorming and a one-question-at-a-time discovery interview. Use when the user invokes `/goal-workflow`, asks to define or refine a durable goal, or wants explicit scope, verification, risk, file-save approval, and execution approval before work begins.
-version: 0.8.0
+version: 0.9.0
 ---
 
 # Goal Workflow
@@ -42,7 +42,7 @@ This is a planning workflow until the goal becomes active. Do not implement the 
 - Do not silently expand scope or weaken verification.
 - Never copy a secret value, credential, or private token into a message, the draft, or the saved goal file; refer to its name and how it is retrieved instead. This holds however harmless the value looks: a development placeholder, an obvious dummy, an expired value, and a value already visible in an inspected file are all reproduced by name only. Judging a value safe to quote is not your call to make, and a goal file outlives the session that wrote it.
 - Verification must not pass on absent, stale, incomplete, unreadable, or indeterminate evidence, or fail on a known benign collision in the target format.
-- Do not mark a goal complete without the evidence required by its saved prompt.
+- Do not report a goal complete without the evidence required by its saved prompt.
 
 For predefined choices, use numbered options and state that the user may answer with only the number. Recommend one option when a useful default exists. For binary approvals, state the accepted affirmative and negative replies; accept `y`/`Y` and `n`/`N` as well as clear natural-language answers.
 
@@ -141,8 +141,8 @@ A dated goal file in the working directory is not by itself a goal in progress. 
 The saved goal file is the durable execution contract. Manage its lifecycle explicitly:
 
 - To pause, stop working and leave the saved goal file untouched so execution can resume from it later.
-- To abandon or clear a goal, remove or supersede its saved file only under explicit user direction. Never mark an unfinished goal complete merely to free the session for another goal.
-- Treat a goal as complete or blocked only when its semantic conditions are genuinely met. Never mark an unfinished goal complete, and mark it blocked only when the task is genuinely blocked.
+- To abandon or clear a goal, remove or supersede its saved file only under explicit user direction. Never report an unfinished goal complete merely to free the session for another goal. A native goal set with `/goal` also needs the user to type `/goal clear`.
+- Treat a goal as complete or blocked only when its semantic conditions are genuinely met. Never report an unfinished goal complete, and report it blocked only when the task is genuinely blocked.
 - After any lifecycle action, re-read the goal file and re-confirm state from the conversation. Do not claim the state changed merely because you took an action; confirm it from observable evidence.
 
 ### Depth
@@ -247,6 +247,10 @@ Draft the complete file in this form:
 
 Follow the saved goal file at `<absolute-path>` and complete it only when all required verification passes; stop to ask if any listed stop condition occurs.
 
+## Goal Condition
+
+Every required verification item in `<absolute-path>` has passed and its result has been reported, or execution has stopped at one of that file's stop conditions and asked the user how to proceed.
+
 ## Full Prompt
 
 ### Objective
@@ -294,7 +298,19 @@ Follow the saved goal file at `<absolute-path>` and complete it only when all re
 Do not mark this goal complete until the objective is achieved and every required verification item passes, unless the user explicitly changes the completion standard.
 ```
 
-The `Goal Directive` is the single canonical start sentence: it must be concise enough to start execution directly or paste verbatim into a new Claude Code session, and the handoff path reuses that exact sentence rather than composing a second one. The saved file remains the detailed source of truth.
+The `Goal Directive` and the `Goal Condition` are the only two start texts. The directive is the sentence that starts execution directly or in a new Claude Code session; the condition is what the user types after `/goal` (see Native Goal). Both must be concise enough to paste verbatim, and every start and handoff reuses them exactly rather than composing new wording. The saved file remains the detailed source of truth.
+
+### Native Goal
+
+Claude Code's built-in `/goal <condition>` command registers a session Stop hook: whenever the session would stop, a model checks the condition, and work continues until it holds. The hook clears itself once the condition is met, `/goal clear` ends it early, and a condition may be at most 4000 characters. Only the user can type the command. You cannot set, clear, or satisfy a native goal yourself, so never claim to have done so.
+
+This workflow uses it as an optional enforcement layer over the saved goal file, never in place of the file or of either gate:
+
+- The saved `Goal Condition` is written for this hook: one declarative sentence that names the file's absolute path and holds when every required verification item has passed and been reported, or when execution has stopped at one of the file's stop conditions and asked the user. Keep the second clause. Without it the hook would push execution past a stop condition, which is exactly the guess this workflow forbids.
+- A native goal visible in the conversation counts as a goal being executed under Existing Goal. If its condition names a different file or different work, it is a conflicting goal. One whose condition is this saved file's own `Goal Condition`, typed at the second gate, is this goal's enforcement rather than a second goal. The Start recheck treats it as the goal being started, not as a duplicate.
+- While a native goal is active, its hook resumes work until the condition holds. Pausing or abandoning therefore also needs the user to type `/goal clear`; say so rather than trying to stop silently.
+- Report completion, or a genuine block, in the conversation with its evidence. There is nothing else to mark: the native goal clears itself once its condition holds.
+- Nothing meters tokens: not this workflow and not `/goal`. A recorded `token_budget` is therefore guidance, not a limit anything enforces.
 
 ### Approve Save
 
@@ -321,6 +337,8 @@ The goal file's own content may be in any language the user approved, but every 
 
 This is the second gate. Only after successful readback, ask in the user's language whether to begin executing the goal from the saved file. When the user has already chosen to run the goal later or in a separate session, ask instead whether to prepare that handoff now; an affirmative answer opens this gate for the handoff path. Either way ask one binary question — do not reopen execute-now versus hand-off as a fresh choice when the user has already stated the preference. Clearly identify this as the second approval gate and name the accepted affirmative and negative replies.
 
+On the in-session path, also show `/goal ` followed by the saved `Goal Condition` verbatim as an alternative affirmative. The user typing that command opens this gate: only the user can issue it, and it names the saved file. Claude Code then also holds the session to the condition. A plain affirmative opens the gate without a native goal.
+
 Enter `start_approved` only after an unambiguous affirmative answer. If the user declines, remain `saved` and provide the absolute file path for later use.
 
 ### Start
@@ -330,8 +348,8 @@ Recheck existing goal state after entering `start_approved`.
 - By default, begin executing the saved goal in the current session: read the saved file as the source of truth and start the work described by its concise `Goal Directive`, provided no conflicting goal is being executed.
 - If a matching goal is already being executed, do not start a duplicate; confirm that it is the execution target. The file just saved is then unused: say so, give both absolute paths, and ask whether to keep it as a successor or remove it. Never delete a file you just saved without asking.
 - If a conflict remains, use the Existing Goal rules and remain `start_approved` until resolved.
-- If the user prefers to run the goal later or in a separate session, hand off instead of executing now: give the saved file's `Goal Directive` verbatim as the message to paste into a new Claude Code session. Do not compose a second, differently worded start sentence. Localize the prose around it as usual; the directive's absolute path is never translated or abbreviated. Do not claim execution began until the user confirms running it or observable progress confirms it.
-- Preserve any explicitly requested `token_budget` in the saved `Execution Options` section so resumed or handed-off execution can recover it. When beginning execution of a goal whose `Execution Options` record a `token_budget`, state that execution proceeds under that budget. Never infer a token budget from interview depth, task size, or available context.
+- If the user prefers to run the goal later or in a separate session, hand off instead of executing now. Give `/goal ` followed by the saved file's `Goal Condition` verbatim as the message to paste into a new Claude Code session. Give the `Goal Directive` verbatim as the fallback for a session where `/goal` is unavailable, such as an untrusted workspace or one with hooks disabled. Do not compose any other start sentence. Localize the prose around them as usual; the absolute path inside them is never translated or abbreviated. Do not claim execution began until the user confirms running it or observable progress confirms it.
+- Preserve any explicitly requested `token_budget` in the saved `Execution Options` section so resumed or handed-off execution can recover it. When beginning execution of a goal whose `Execution Options` record a `token_budget`, state that execution proceeds under that budget and that nothing enforces it. Prefer the cheaper of equivalent approaches, and stop to ask when the remaining work clearly cannot fit the budget. Never infer a token budget from interview depth, task size, or available context.
 
 Enter `active` only after in-session execution has begun, the matching goal was confirmed as the execution target, or the user confirmed running the handoff.
 
@@ -346,7 +364,7 @@ Once active, treat the saved goal file as read-only and as the source of truth:
 - Treat skipped, zero-work, missing, stale, unreadable, truncated, or otherwise indeterminate evidence as failed verification unless the saved prompt explicitly defines it as acceptable.
 - When a check fails, distinguish product failure from verifier or environment failure. Do not change product behavior merely to appease a false positive or treat a verifier failure as success. Repair a project-owned verifier only when scope permits and the acceptance criterion remains unchanged; otherwise follow the material goal-revision rules.
 - Do not silently edit the active goal file. If the goal must change materially, stop execution, obtain explicit user direction, create a versioned successor by default, and repeat the draft, save, and start approvals as applicable.
-- Mark complete only when the objective is achieved and all required evidence passes. Mark blocked only when the task is genuinely blocked.
+- Report completion only when the objective is achieved and all required evidence passes. Report a block only when the task is genuinely blocked.
 
 At completion, report the absolute goal file path, material changes, verification results, and remaining risks.
 

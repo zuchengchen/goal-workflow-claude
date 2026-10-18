@@ -1146,6 +1146,109 @@ def check_preflight_covers_every_model() -> None:
     )
 
 
+GOAL_WITH_CONDITION = (
+    "# Goal: Fix the help typo\n\n"
+    "## Goal Directive\n\nFollow the saved goal file at `/w/2026-07-26-typo.md` and complete it.\n\n"
+    "## Goal Condition\n\n"
+    "Every required verification item in `/w/2026-07-26-typo.md` has passed\n"
+    "and its result has been reported, or execution has stopped at one of that file's\n"
+    "stop conditions and asked the user how to proceed.\n\n"
+    "## Full Prompt\n\n### Objective\n\nFix the typo.\n"
+)
+TYPED_CONDITION = (
+    "Every required verification item in `/w/2026-07-26-typo.md` has passed and its result "
+    "has been reported, or execution has stopped at one of that file's stop conditions and "
+    "asked the user how to proceed."
+)
+
+
+def check_native_goal_reply() -> None:
+    """A scripted `/goal` start reply opens gate 2 and is typed from the saved file."""
+    check(
+        "/goal at the start gate opens execution",
+        deterministic_failures(
+            case("y", "/goal"),
+            [
+                turn(0),
+                turn(1, checkpoint="save_approval", goal_files=["g.md"], tools=[write(GOAL)]),
+                turn(2, checkpoint="start_approval", goal_files=["g.md"], tools=[write(SRC)]),
+            ],
+            [],
+        ),
+        expect=None,
+    )
+
+    with tempfile.TemporaryDirectory() as raw:
+        work = Path(raw)
+        (work / "2026-07-26-typo.md").write_text(GOAL_WITH_CONDITION, encoding="utf-8")
+        found = run_evals.saved_goal_condition(work, {})
+    expect_true(
+        "the saved Goal Condition is read as one typed line",
+        found == TYPED_CONDITION,
+        f"got {found!r}",
+    )
+
+    def run_with_saved(body: str) -> tuple[run_evals.CaseResult, list[str]]:
+        stub_case = {
+            "id": "native-goal",
+            "title": "starts with /goal",
+            "prompt": "do the thing",
+            "user_language": "en-US",
+            "setup": {},
+            "checkpoint_replies": [
+                {"at": "save_approval", "content": "y"},
+                {"at": "start_approval", "content": "/goal"},
+            ],
+            "expected": {"forbidden_actions": [], "required_behaviors": [], "tool_order": [],
+                         "terminal_state": "goal_started"},
+        }
+        sent: list[str] = []
+        checkpoints = iter(["save_approval", "start_approval"])
+
+        def fake_turn(message, session_id, work, *rest):
+            sent.append(message)
+            if message == "y":
+                target = Path(work) / "2026-07-26-typo.md"
+                target.write_text(body, encoding="utf-8")
+                return "s-1", "Saved.", [write(str(target))]
+            return "s-1", "Working.", []
+
+        originals = (run_evals.run_claude_turn, run_evals.build_config_dir,
+                     run_evals.simulate_user, run_evals.judge_case)
+        run_evals.run_claude_turn = fake_turn
+        run_evals.build_config_dir = lambda base: base / "config"
+        run_evals.simulate_user = lambda *a, **k: {
+            "state": "checkpoint", "checkpoint": next(checkpoints), "reply": "-"
+        }
+        run_evals.judge_case = lambda *a, **k: {
+            "required_behaviors": [], "forbidden_actions": [], "tool_order": [],
+            "terminal_state": {"expected": "x", "observed": "x", "matches": True,
+                               "evidence": "-"},
+        }
+        try:
+            return run_case(stub_case, {}, run_case_args(max_turns=6)), sent
+        finally:
+            (run_evals.run_claude_turn, run_evals.build_config_dir,
+             run_evals.simulate_user, run_evals.judge_case) = originals
+
+    result, sent = run_with_saved(GOAL_WITH_CONDITION)
+    expect_true(
+        "the start reply is sent as /goal with the saved condition",
+        result.passed and sent[-1] == f"/goal {TYPED_CONDITION}",
+        f"passed={result.passed} harness={result.harness_error!r} sent={sent}",
+    )
+
+    result, sent = run_with_saved("# Goal: no condition\n\n## Goal Directive\n\nFollow it.\n")
+    expect_true(
+        "a saved file without a Goal Condition fails the case instead of guessing one",
+        not result.passed
+        and result.harness_error is None
+        and any("Goal Condition" in failure for failure in result.failures)
+        and not any(message.startswith("/goal") for message in sent),
+        f"harness={result.harness_error!r} failures={result.failures} sent={sent}",
+    )
+
+
 def check_spawn_env_keeps_auth() -> None:
     saved = dict(os.environ)
     os.environ.update({
@@ -1696,6 +1799,7 @@ def main() -> int:
     check_interrupts_are_honoured()
     check_preflight_covers_every_model()
     check_spawn_env_keeps_auth()
+    check_native_goal_reply()
 
     print()
     if FAILURES:
